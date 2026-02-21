@@ -1,16 +1,20 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f docker-compose.yml
 
-.PHONY: build up down ps logs lint test
+.PHONY: build up down ps logs lint test migrate test-stage2 print-port
 
 build:
 	$(COMPOSE) build api
 
 up:
-	$(COMPOSE) up -d --build --wait
+	@API_PORT_RESOLVED=$$(python3 scripts/find_free_port.py --start "$${API_PORT:-18000}"); \
+	echo "Выбран порт API: $$API_PORT_RESOLVED"; \
+	echo "$$API_PORT_RESOLVED" > .api_port; \
+	API_PORT=$$API_PORT_RESOLVED $(COMPOSE) up -d --build --wait
 
 down:
 	$(COMPOSE) down --remove-orphans
+	@rm -f .api_port
 
 ps:
 	$(COMPOSE) ps
@@ -23,3 +27,16 @@ lint: build
 
 test: build
 	$(COMPOSE) run --rm --no-deps api python scripts/run_tests_with_coverage.py
+
+migrate:
+	python3 scripts/migrate.py
+
+test-stage2: migrate
+	python3 scripts/test_stage2_geometry.py
+
+print-port:
+	@if [ -f .api_port ]; then \
+		echo "API_PORT=$$(cat .api_port)"; \
+	else \
+		echo "API_PORT не определён. Выполните make up."; \
+	fi

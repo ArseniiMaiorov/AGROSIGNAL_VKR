@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: up down lint test ps logs
+.PHONY: up down lint test migrate test-stage2 ps logs print-port
 
 up:
 	$(MAKE) -C backend up
@@ -14,8 +14,17 @@ lint:
 test:
 	$(MAKE) -C backend test
 
+migrate:
+	$(MAKE) -C backend migrate
+
+test-stage2:
+	$(MAKE) -C backend test-stage2
+
 ps:
 	$(MAKE) -C backend ps
 
 logs:
 	$(MAKE) -C backend logs
+
+print-port:
+	$(MAKE) -C backend print-port
