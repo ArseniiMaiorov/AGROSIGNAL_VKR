@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -109,19 +110,76 @@ def api_request(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:
             text = response.read().decode("utf-8")
-            data = json.loads(text) if text else {}
+            if text:
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    data = {"raw": text}
+            else:
+                data = {}
             return int(response.status), data, dict(response.headers)
     except urllib.error.HTTPError as exc:
         text = exc.read().decode("utf-8")
-        data = json.loads(text) if text else {}
+        if text:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = {"raw": text}
+        else:
+            data = {}
         return int(exc.code), data, dict(exc.headers)
+
+
+def raw_request(
+    *,
+    base_url: str,
+    method: str,
+    path: str,
+    email: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes, dict[str, str]]:
+    request_headers = {"X-User-Email": email}
+    if headers:
+        request_headers.update(headers)
+
+    request = urllib.request.Request(
+        url=f"{base_url}{path}",
+        method=method,
+        headers=request_headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return int(response.status), response.read(), dict(response.headers)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), exc.read(), dict(exc.headers)
 
 
 def load_geometry(name: str) -> dict[str, Any]:
     payload = json.loads((FIXTURES_GEO / name).read_text(encoding="utf-8"))
     return payload["geometry"]
+
+
+def bbox_of_geometry(geometry: dict[str, Any]) -> tuple[float, float, float, float]:
+    coords: list[tuple[float, float]] = []
+    for ring in geometry.get("coordinates", []):
+        for point in ring:
+            if isinstance(point, list) and len(point) >= 2:
+                coords.append((float(point[0]), float(point[1])))
+    if not coords:
+        raise ValueError("Пустая геометрия для bbox")
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    return min(lons), min(lats), max(lons), max(lats)
+
+
+def tile_for_point(lon: float, lat: float, zoom: int) -> tuple[int, int]:
+    lat_rad = math.radians(lat)
+    n = 2 ** zoom
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return x, y
 
 
 def seed_wind_value(field_id: int, value: float, source: str) -> str:
@@ -174,6 +232,8 @@ def main() -> int:
 
     enterprise_id = 1
     field_id = 0
+    field_bbox_str = ""
+    field_center = (0.0, 0.0)
     season_id = 0
     crop_id = 0
     rule_id = 0
@@ -264,6 +324,10 @@ def main() -> int:
         )
         field = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
         field_id = int(field.get("id") or 0)
+        geometry_for_bbox = field.get("geometry") if isinstance(field.get("geometry"), dict) else load_geometry("field_ok.geojson")
+        min_lon, min_lat, max_lon, max_lat = bbox_of_geometry(geometry_for_bbox)
+        field_bbox_str = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+        field_center = ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0)
         ok = status == 201 and field_id > 0 and float(field.get("area_ha") or 0) > 0 and field.get("bbox") is not None
         add_case(
             cases,
@@ -710,6 +774,252 @@ def main() -> int:
             actual=(
                 f"fields_status={fields_status}, fields_items={len(fields_items)}, "
                 f"metrics_status={metrics_status}, audit_status={audit_status}, audit_items={len(audit_items)}"
+            ),
+        )
+
+        # 13) Layer registry
+        layers_status, layers_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path="/api/v1/layers?source=copernicus",
+            email=manager_email,
+        )
+        layer_items = layers_payload.get("data", {}).get("items", []) if isinstance(layers_payload.get("data"), dict) else []
+        has_wind_layer = any(item.get("layer_id") == "weather.wind_vector_10m" for item in layer_items if isinstance(item, dict))
+        ok = layers_status == 200 and isinstance(layer_items, list) and has_wind_layer
+        add_case(
+            cases,
+            feature="Реестр слоёв (Layer Registry)",
+            input_data="GET /layers?source=copernicus",
+            expected="200 + список слоёв с time/spatial/legend/source_meta",
+            ok=ok,
+            actual=f"status={layers_status}, layers={len(layer_items)}, has_wind_layer={has_wind_layer}",
+        )
+
+        # 14) Layer grid + tiles (ETag)
+        grid_status, grid_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=(
+                f"/api/v1/layers/weather.wind_vector_10m/grid?bbox={field_bbox_str}"
+                f"&zoom=12&from={from_48h}&to={to_now}&granularity=hour&agg=mean&field_id={field_id}&source=Copernicus"
+            ),
+            email=manager_email,
+        )
+        grid_data = grid_payload.get("data", {}) if isinstance(grid_payload.get("data"), dict) else {}
+        grid_cells = grid_data.get("grid", {}).get("cells", []) if isinstance(grid_data.get("grid"), dict) else []
+
+        center_lon, center_lat = field_center
+        tile_z = 13
+        tile_x, tile_y = tile_for_point(center_lon, center_lat, tile_z)
+        tile_path = (
+            f"/api/v1/layers/weather.wind_vector_10m/tiles/{tile_z}/{tile_x}/{tile_y}"
+            f"?time={to_now}&granularity=hour&agg=mean&source=Copernicus&field_id={field_id}"
+        )
+        tile_status, tile_body, tile_headers = raw_request(
+            base_url=base_url,
+            method="GET",
+            path=tile_path,
+            email=manager_email,
+        )
+        etag = tile_headers.get("ETag")
+        tile_json = json.loads(tile_body.decode("utf-8")) if tile_status == 200 and tile_body else {}
+
+        tile_304_status, _, _ = raw_request(
+            base_url=base_url,
+            method="GET",
+            path=tile_path,
+            email=manager_email,
+            headers={"If-None-Match": etag or ""},
+        )
+        ok = (
+            grid_status == 200
+            and isinstance(grid_cells, list)
+            and len(grid_cells) > 0
+            and tile_status == 200
+            and bool(etag)
+            and tile_304_status == 304
+            and isinstance(tile_json.get("payload"), dict)
+        )
+        add_case(
+            cases,
+            feature="Карта: grid и tiles + кэш",
+            input_data="GET /layers/{layer_id}/grid и /tiles/{z}/{x}/{y}",
+            expected="Grid-ячейки, tile-ответ с ETag и 304 при повторе",
+            ok=ok,
+            actual=(
+                f"grid_status={grid_status}, cells={len(grid_cells)}, tile_status={tile_status}, "
+                f"etag={bool(etag)}, tile_304={tile_304_status}"
+            ),
+        )
+
+        # 15) Hover probe
+        probe_status, probe_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=(
+                f"/api/v1/fields/{field_id}/probe?lat={center_lat}&lon={center_lon}"
+                f"&time={to_now}&layers=weather.wind_vector_10m,satellite.ndvi&source=Copernicus"
+            ),
+            email=manager_email,
+        )
+        probe_data = probe_payload.get("data", {}) if isinstance(probe_payload.get("data"), dict) else {}
+        probe_values = probe_data.get("values", []) if isinstance(probe_data, dict) else []
+        ok = (
+            probe_status == 200
+            and isinstance(probe_values, list)
+            and isinstance(probe_data.get("mini_stats"), dict)
+            and isinstance(probe_data.get("mini_reco"), str)
+        )
+        add_case(
+            cases,
+            feature="Hover/Probe по точке",
+            input_data="GET /fields/{id}/probe?lat=&lon=&time=&layers=",
+            expected="values + mini_stats + mini_reco + last_sync_at",
+            ok=ok,
+            actual=f"status={probe_status}, values={len(probe_values)}, mini_stats={probe_data.get('mini_stats')}",
+        )
+
+        # 16) Zones + zonal stats
+        zones_status, zones_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=f"/api/v1/fields/{field_id}/zones?zoom=12&time={to_now}&method=grid&source=Copernicus",
+            email=manager_email,
+        )
+        zones_data = zones_payload.get("data", {}) if isinstance(zones_payload.get("data"), dict) else {}
+        zones_items = zones_data.get("zones", []) if isinstance(zones_data, dict) else []
+        zone_id = str(zones_items[0].get("zone_id")) if zones_items else ""
+
+        zonal_status, zonal_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=(
+                f"/api/v1/fields/{field_id}/zonal-stats?zone_id={zone_id}"
+                f"&from={from_48h}&to={to_now}&metrics=ndvi,temperature&source=Copernicus"
+            ),
+            email=manager_email,
+        )
+        zonal_items = zonal_payload.get("data", {}).get("items", []) if isinstance(zonal_payload.get("data"), dict) else []
+        ok = zones_status == 200 and len(zones_items) > 0 and zonal_status == 200 and len(zonal_items) > 0
+        add_case(
+            cases,
+            feature="Zones + zonal-stats",
+            input_data="GET /fields/{id}/zones и /fields/{id}/zonal-stats",
+            expected="Сформированы зоны с rank и статистикой неоднородности",
+            ok=ok,
+            actual=(
+                f"zones_status={zones_status}, zones={len(zones_items)}, "
+                f"zonal_status={zonal_status}, zonal_items={len(zonal_items)}"
+            ),
+        )
+
+        # 17) SSE stream
+        stream_status, stream_body, stream_headers = raw_request(
+            base_url=base_url,
+            method="GET",
+            path="/api/v1/stream",
+            email=manager_email,
+        )
+        stream_text = stream_body.decode("utf-8", errors="replace")
+        ok = (
+            stream_status == 200
+            and "text/event-stream" in str(stream_headers.get("Content-Type", ""))
+            and ("event: sync_updated" in stream_text or "event: heartbeat" in stream_text)
+        )
+        add_case(
+            cases,
+            feature="SSE поток статусов",
+            input_data="GET /stream",
+            expected="event-stream с событиями sync/export/scenario",
+            ok=ok,
+            actual=f"status={stream_status}, content_type={stream_headers.get('Content-Type')}",
+        )
+
+        # 18) Scenario modeling
+        scenario_status, scenario_payload, _ = api_request(
+            base_url=base_url,
+            method="POST",
+            path="/api/v1/modeling/scenarios",
+            email=manager_email,
+            payload={
+                "field_id": field_id,
+                "source": "Copernicus",
+                "from": from_48h,
+                "to": to_now,
+                "params": {
+                    "rain_delta_mm": 12,
+                    "temp_shift_c": 2,
+                    "wind_shift_ms": 1.5,
+                    "irrigation_event": {"mm": 8},
+                },
+            },
+        )
+        scenario_id = str(scenario_payload.get("data", {}).get("scenario_id") or "")
+
+        patch_status, _, _ = api_request(
+            base_url=base_url,
+            method="PATCH",
+            path=f"/api/v1/modeling/scenarios/{scenario_id}",
+            email=manager_email,
+            payload={"params": {"operation_shift": {"days": 2}}},
+        )
+
+        run_status, run_payload, _ = api_request(
+            base_url=base_url,
+            method="POST",
+            path=f"/api/v1/modeling/scenarios/{scenario_id}/run",
+            email=manager_email,
+            payload={},
+        )
+
+        get_status, get_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=f"/api/v1/modeling/scenarios/{scenario_id}",
+            email=manager_email,
+        )
+        result_status, result_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=f"/api/v1/modeling/scenarios/{scenario_id}/result",
+            email=manager_email,
+        )
+        diff_status, diff_payload, _ = api_request(
+            base_url=base_url,
+            method="GET",
+            path=f"/api/v1/modeling/scenarios/{scenario_id}/diff",
+            email=manager_email,
+        )
+
+        result_data = result_payload.get("data", {}) if isinstance(result_payload.get("data"), dict) else {}
+        result_obj = result_data.get("result") if isinstance(result_data, dict) else None
+        result_values = result_obj.get("values", []) if isinstance(result_obj, dict) else []
+        diff_data = diff_payload.get("data", {}) if isinstance(diff_payload.get("data"), dict) else {}
+        diff_obj = diff_data.get("diff") if isinstance(diff_data, dict) else None
+        diff_metrics = diff_obj.get("metrics", []) if isinstance(diff_obj, dict) else []
+        ok = (
+            scenario_status == 201
+            and bool(scenario_id)
+            and patch_status == 200
+            and run_status == 202
+            and get_status == 200
+            and result_status == 200
+            and diff_status == 200
+            and isinstance(result_values, list)
+            and len(result_values) > 0
+            and isinstance(diff_metrics, list)
+            and len(diff_metrics) > 0
+        )
+        add_case(
+            cases,
+            feature="Modeling/Scenario (what-if)",
+            input_data="POST/PATCH/POST run + GET scenario/result/diff",
+            expected="Сценарий запускается и возвращает result/diff в контракте source=scenario",
+            ok=ok,
+            actual=(
+                f"create={scenario_status}, patch={patch_status}, run={run_status}, "
+                f"result={result_status}/{len(result_values)}, diff={diff_status}/{len(diff_metrics)}"
             ),
         )
 

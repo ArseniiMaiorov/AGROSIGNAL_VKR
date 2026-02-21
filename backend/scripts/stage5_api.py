@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -63,6 +65,16 @@ SOURCE_ALIASES = {
     "nasa": "NASA",
     "mock": "Mock",
 }
+LAYER_METRIC_MAP = {
+    "weather.wind_vector_10m": ("wind_speed",),
+    "weather.temperature_2m": ("temperature",),
+    "weather.precipitation": ("precipitation",),
+    "satellite.ndvi": ("ndvi",),
+    "satellite.ndre": ("ndre",),
+    "satellite.ndmi": ("ndmi",),
+    "satellite.cloud_mask": ("cloud_mask", "cloudiness"),
+}
+SCALAR_AGGREGATIONS = {"mean", "sum", "min", "max", "p10", "p90", "median"}
 
 
 class ApiError(RuntimeError):
@@ -370,6 +382,74 @@ class Stage5ApiApp:
             response = self._sync_run(db, user, payload, request_id, idempotency_key)
             return response
 
+        # Map-first API (layers/grid/tiles/probe/zones)
+        if path == "/api/v1/layers" and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._list_layers(db, query)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        layer_id_for_grid = self._match_text(path, r"^/api/v1/layers/([a-zA-Z0-9_.-]+)/grid$")
+        if layer_id_for_grid is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data, no_data = self._get_layer_grid(db, user, layer_id_for_grid, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        layer_tile_match = re.fullmatch(r"^/api/v1/layers/([a-zA-Z0-9_.-]+)/tiles/(\d+)/(\d+)/(\d+)$", path)
+        if layer_tile_match is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            layer_id, z_raw, x_raw, y_raw = layer_tile_match.groups()
+            return self._get_layer_tile(
+                db,
+                user,
+                layer_id=layer_id,
+                z=int(z_raw),
+                x=int(x_raw),
+                y=int(y_raw),
+                query=query,
+                request_headers=headers,
+                request_id=request_id,
+            )
+
+        field_probe_id = self._match_id(path, r"^/api/v1/fields/(\d+)/probe$")
+        if field_probe_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data, no_data = self._probe_field_layers(db, user, field_probe_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        field_zones_id = self._match_id(path, r"^/api/v1/fields/(\d+)/zones$")
+        if field_zones_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_field_zones(db, user, field_zones_id, query)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        field_zonal_stats_id = self._match_id(path, r"^/api/v1/fields/(\d+)/zonal-stats$")
+        if field_zonal_stats_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data, no_data = self._get_field_zonal_stats(db, user, field_zonal_stats_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        if path == "/api/v1/stream" and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            return self._stream_events(db, user, request_id)
+
         # Assistant
         if path == "/api/v1/assistant/rules":
             if method == "GET":
@@ -439,6 +519,43 @@ class Stage5ApiApp:
         if export_download_id is not None and method == "GET":
             self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
             return self._download_export_job(db, user, export_download_id, request_id)
+
+        # Scenario modeling
+        if path == "/api/v1/modeling/scenarios" and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+            payload = self._parse_json_body(raw_body)
+            created = self._create_scenario(db, user, payload, request_id)
+            return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        scenario_id = self._match_text(path, r"^/api/v1/modeling/scenarios/([a-zA-Z0-9_-]+)$")
+        if scenario_id is not None:
+            if method == "GET":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+                data = self._get_scenario(db, user, scenario_id)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "PATCH":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                data = self._update_scenario(db, user, scenario_id, payload, request_id)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        scenario_run_id = self._match_text(path, r"^/api/v1/modeling/scenarios/([a-zA-Z0-9_-]+)/run$")
+        if scenario_run_id is not None and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+            data = self._run_scenario(db, user, scenario_run_id, request_id)
+            return self._success(data, request_id=request_id, status=202, user_id=user.user_id)
+
+        scenario_result_id = self._match_text(path, r"^/api/v1/modeling/scenarios/([a-zA-Z0-9_-]+)/result$")
+        if scenario_result_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_scenario_result(db, user, scenario_result_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        scenario_diff_id = self._match_text(path, r"^/api/v1/modeling/scenarios/([a-zA-Z0-9_-]+)/diff$")
+        if scenario_diff_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_scenario_diff(db, user, scenario_diff_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
 
         raise ApiError("NOT_FOUND", "Объект не найден", status=404)
 
@@ -1944,6 +2061,1449 @@ class Stage5ApiApp:
         )
 
     # -------------------------------
+    # Map-first API: layers/grid/tiles/probe/zones + stream
+    # -------------------------------
+    def _list_layers(self, db: DbClient, query: dict[str, list[str]]) -> dict[str, Any]:
+        source_raw = self._query_str(query, "source", required=False)
+        source = self._normalize_source(source_raw) if source_raw else None
+
+        where_sql = "lr.is_active = TRUE"
+        if source:
+            where_sql += f" AND lr.source = {_sql_quote(source)}"
+
+        rows = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.layer_id, x.source), '[]'::json)
+            FROM (
+                SELECT
+                    lr.layer_id,
+                    lr.title_ru,
+                    lr.category,
+                    lr.value_type,
+                    lr.units,
+                    lr.time_available,
+                    lr.default_granularity,
+                    lr.max_lookback_days,
+                    lr.spatial_modes,
+                    lr.zoom_rules,
+                    lr.grid_sizes_m,
+                    lr.legend,
+                    lr.has_quality_flags,
+                    lr.quality_rules,
+                    lr.source,
+                    lr.status AS registry_status,
+                    CASE
+                        WHEN ps.last_success_at IS NULL THEN to_char(ps.last_sync_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                        ELSE to_char(ps.last_success_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    END AS last_sync_at,
+                    ps.status AS sync_status
+                FROM api_layer_registry lr
+                LEFT JOIN provider_sync_status ps ON ps.source = lr.source
+                WHERE {where_sql}
+            ) x;
+            """
+        )
+        assert isinstance(rows, list)
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sync_status = str(row.get("sync_status") or "")
+            registry_status = str(row.get("registry_status") or "OK")
+            source_status = self._source_status_label(sync_status, registry_status)
+            items.append(
+                {
+                    "layer_id": row.get("layer_id"),
+                    "title_ru": row.get("title_ru"),
+                    "category": row.get("category"),
+                    "value_type": row.get("value_type"),
+                    "units": row.get("units"),
+                    "time_support": {
+                        "available": row.get("time_available") or [],
+                        "default_granularity": row.get("default_granularity"),
+                        "max_lookback_days": row.get("max_lookback_days"),
+                    },
+                    "spatial_support": {
+                        "modes": row.get("spatial_modes") or [],
+                        "zoom_levels": row.get("zoom_rules") or {},
+                        "grid_sizes_m": row.get("grid_sizes_m") or [],
+                    },
+                    "legend": row.get("legend") or {},
+                    "quality": {
+                        "has_quality_flags": bool(row.get("has_quality_flags")),
+                        "quality_rules": row.get("quality_rules"),
+                    },
+                    "source_meta": {
+                        "source": str(row.get("source") or "").lower(),
+                        "last_sync_at": row.get("last_sync_at"),
+                        "status": source_status,
+                    },
+                }
+            )
+
+        return {"items": items, "total": len(items)}
+
+    def _get_layer_grid(
+        self,
+        db: DbClient,
+        user: UserContext,
+        layer_id: str,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        layer = self._load_layer(db, layer_id, source)
+
+        bbox = self._parse_bbox(self._query_str(query, "bbox", required=True))
+        zoom = self._int_value(self._query_str(query, "zoom", required=True), "zoom", min_value=0, max_value=22)
+        field_id = self._query_int(query, "field_id")
+        if field_id is not None:
+            field = self._get_field(db, user, field_id, include_deleted=False)
+            self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        range_start, range_end = self._resolve_time_range(query)
+        granularity = self._query_str(query, "granularity", required=False) or str(layer.get("default_granularity") or "hour")
+        allowed_granularities = {str(item) for item in (layer.get("time_available") or [])}
+        if granularity not in allowed_granularities:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: granularity", status=422)
+
+        agg = self._query_str(query, "agg", required=False) or "mean"
+        if agg not in SCALAR_AGGREGATIONS:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: agg", status=422)
+
+        rows = self._load_layer_points(
+            db,
+            source=source,
+            layer_id=layer_id,
+            range_start=range_start,
+            range_end=range_end,
+            field_id=field_id,
+            enterprise_id=(None if user.role_code == ROLE_ADMIN else user.enterprise_id),
+        )
+        no_data = len(rows) == 0
+
+        cell_size_m = self._select_cell_size(layer, zoom)
+        values_by_metric: dict[str, list[float]] = {}
+        for row in rows:
+            metric = str(row.get("metric") or "")
+            value = row.get("value")
+            if metric not in values_by_metric:
+                values_by_metric[metric] = []
+            if value is not None:
+                values_by_metric[metric].append(float(value))
+
+        base_metric = LAYER_METRIC_MAP[layer_id][0]
+        base_values = values_by_metric.get(base_metric, [])
+        aggregated_value = self._aggregate_values(base_values, agg) if base_values else 0.0
+
+        cells: list[dict[str, Any]] = []
+        if not no_data:
+            def build_payload(ix: int, iy: int, center_lon: float, center_lat: float) -> dict[str, Any]:
+                jitter = ((ix * 92821 + iy * 68917 + len(layer_id)) % 100) / 1000.0
+                if layer.get("value_type") == "vector":
+                    speed = max(0.0, aggregated_value * (0.95 + jitter))
+                    direction = float((ix * 31 + iy * 17 + 180) % 360)
+                    rad = math.radians(direction)
+                    u = round(speed * math.sin(rad), 4)
+                    v = round(speed * math.cos(rad), 4)
+                    return {
+                        "u": round(u, 4),
+                        "v": round(v, 4),
+                        "speed": round(speed, 4),
+                        "direction_deg": round(direction, 2),
+                        "units": layer.get("units"),
+                    }
+
+                value = max(0.0, aggregated_value * (0.95 + jitter))
+                return {"value": round(value, 4), "units": layer.get("units")}
+
+            cells = self._build_grid_cells(bbox, cell_size_m, build_payload)
+
+        quality_summary = self._quality_flags_summary(rows)
+        last_sync_at = self._source_last_sync(db, source)
+        data = {
+            "layer_id": layer_id,
+            "source": source,
+            "bbox": bbox,
+            "zoom": zoom,
+            "field_id": field_id,
+            "granularity": granularity,
+            "agg": agg,
+            "time": {
+                "from": _iso_utc(range_start),
+                "to": _iso_utc(range_end),
+            },
+            "grid": {
+                "cell_size_m": cell_size_m,
+                "coverage": 0 if no_data else 100,
+                "cells": cells,
+            },
+            "meta": {
+                "source": source,
+                "last_sync_at": last_sync_at,
+                "quality_flags_summary": quality_summary,
+                "contract_version": CONTRACT_VERSION,
+            },
+        }
+        return data, no_data
+
+    def _get_layer_tile(
+        self,
+        db: DbClient,
+        user: UserContext,
+        *,
+        layer_id: str,
+        z: int,
+        x: int,
+        y: int,
+        query: dict[str, list[str]],
+        request_headers: dict[str, str],
+        request_id: str,
+    ) -> ApiHttpResponse:
+        if z < 0 or z > 22 or x < 0 or y < 0:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: z/x/y", status=422)
+
+        min_lon, min_lat, max_lon, max_lat = self._tile_bbox(z, x, y)
+        grid_query = dict(query)
+        grid_query["bbox"] = [f"{min_lon},{min_lat},{max_lon},{max_lat}"]
+        grid_query["zoom"] = [str(z)]
+        data, no_data = self._get_layer_grid(db, user, layer_id, grid_query)
+
+        payload = {
+            "tile": {"z": z, "x": x, "y": y},
+            "layer_id": layer_id,
+            "no_data": no_data,
+            "payload": data,
+        }
+        body = self._json_bytes(payload)
+        etag = hashlib.sha256(body).hexdigest()
+
+        if_none_match = self._header(request_headers, "if-none-match")
+        if if_none_match and if_none_match == etag:
+            return ApiHttpResponse(
+                status_code=304,
+                body=b"",
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "public, max-age=120",
+                },
+                user_id=user.user_id,
+            )
+
+        response_headers = {
+            "ETag": etag,
+            "Cache-Control": "public, max-age=120",
+            "Vary": "Accept-Encoding",
+        }
+
+        content_encoding = None
+        accept_encoding = (self._header(request_headers, "accept-encoding") or "").lower()
+        if "gzip" in accept_encoding:
+            body = gzip.compress(body, compresslevel=5)
+            content_encoding = "gzip"
+
+        if content_encoding:
+            response_headers["Content-Encoding"] = content_encoding
+
+        return ApiHttpResponse(
+            status_code=200,
+            body=body,
+            content_type="application/json; charset=utf-8",
+            headers=response_headers,
+            user_id=user.user_id,
+        )
+
+    def _probe_field_layers(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        lat = float(self._str_value(self._query_str(query, "lat", required=True), "lat", min_len=1, max_len=32))
+        lon = float(self._str_value(self._query_str(query, "lon", required=True), "lon", min_len=1, max_len=32))
+        at = self._parse_datetime(self._query_str(query, "time", required=True))
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+
+        if not self._point_in_field(db, field_id, lon, lat):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: точка вне поля", status=422)
+
+        layers_raw = self._query_str(query, "layers", required=True)
+        layer_ids = [item.strip() for item in layers_raw.split(",") if item.strip()]
+        if not layer_ids:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: layers", status=422)
+
+        values: list[dict[str, Any]] = []
+        for layer_id in layer_ids:
+            if layer_id not in LAYER_METRIC_MAP:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: неизвестный layer_id", status=422)
+            layer = self._load_layer(db, layer_id, source)
+            probe_value = self._probe_layer_value(db, field_id, source, layer_id, at)
+            if probe_value is None:
+                continue
+            values.append(
+                {
+                    "layer_id": layer_id,
+                    "value": probe_value.get("value"),
+                    "units": layer.get("units"),
+                    "quality": probe_value.get("quality"),
+                    "timestamp": probe_value.get("timestamp"),
+                    "source": source,
+                }
+            )
+
+        precipitation_24h = self._metric_aggregate(
+            db,
+            field_id=field_id,
+            source=source,
+            metric="precipitation",
+            range_start=at - timedelta(hours=24),
+            range_end=at,
+            agg="sum",
+        )
+        wind_avg_6h = self._metric_aggregate(
+            db,
+            field_id=field_id,
+            source=source,
+            metric="wind_speed",
+            range_start=at - timedelta(hours=6),
+            range_end=at,
+            agg="mean",
+        )
+
+        if wind_avg_6h is not None and wind_avg_6h > 8:
+            mini_reco = "Ветер высокий, опрыскивание лучше отложить."
+        elif precipitation_24h is not None and precipitation_24h > 15:
+            mini_reco = "Ожидаются значимые осадки, проверьте план полевых работ."
+        else:
+            mini_reco = "Критичных отклонений нет, продолжайте мониторинг слоя."
+
+        no_data = len(values) == 0
+        data = {
+            "field_id": field_id,
+            "probe": {"lat": lat, "lon": lon, "time": _iso_utc(at)},
+            "values": values,
+            "mini_stats": {
+                "precipitation_sum_24h_mm": round(float(precipitation_24h or 0.0), 4),
+                "wind_avg_6h_ms": round(float(wind_avg_6h or 0.0), 4),
+            },
+            "mini_reco": mini_reco,
+            "meta": {
+                "last_sync_at": self._source_last_sync(db, source),
+                "source": source,
+            },
+        }
+        return data, no_data
+
+    def _get_field_zones(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        method = self._query_str(query, "method", required=False) or "grid"
+        if method not in {"grid", "quantiles", "kmeans"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: method", status=422)
+
+        zoom = self._int_value(self._query_str(query, "zoom", required=True), "zoom", min_value=0, max_value=22)
+        generated_at = self._parse_datetime(self._query_str(query, "time", required=False) or _iso_utc(datetime.now(timezone.utc)))
+        generated_hour = generated_at.replace(minute=0, second=0, microsecond=0)
+
+        bbox = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    ST_XMin(bbox) AS min_lon,
+                    ST_YMin(bbox) AS min_lat,
+                    ST_XMax(bbox) AS max_lon,
+                    ST_YMax(bbox) AS max_lat
+                FROM fields
+                WHERE id = {field_id}
+            ) x;
+            """
+        )
+        if not isinstance(bbox, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+
+        base_ndvi = self._metric_aggregate(
+            db,
+            field_id=field_id,
+            source=source,
+            metric="ndvi",
+            range_start=generated_hour - timedelta(days=2),
+            range_end=generated_hour,
+            agg="mean",
+        ) or 0.4
+
+        side = 2 if zoom <= 9 else (3 if zoom <= 12 else 4)
+        min_lon = float(bbox["min_lon"])
+        min_lat = float(bbox["min_lat"])
+        max_lon = float(bbox["max_lon"])
+        max_lat = float(bbox["max_lat"])
+        step_lon = (max_lon - min_lon) / side
+        step_lat = (max_lat - min_lat) / side
+
+        raw_zones: list[dict[str, Any]] = []
+        for iy in range(side):
+            for ix in range(side):
+                lon1 = min_lon + ix * step_lon
+                lon2 = min(max_lon, lon1 + step_lon)
+                lat1 = min_lat + iy * step_lat
+                lat2 = min(max_lat, lat1 + step_lat)
+                weight = 0.85 + ((ix + iy + 1) / max(1, side * side)) * 0.3
+                zone_value = max(0.05, min(1.0, base_ndvi * weight))
+                raw_zones.append(
+                    {
+                        "lon1": lon1,
+                        "lon2": lon2,
+                        "lat1": lat1,
+                        "lat2": lat2,
+                        "mean": round(zone_value, 4),
+                    }
+                )
+
+        sorted_for_rank = sorted(enumerate(raw_zones), key=lambda item: item[1]["mean"], reverse=True)
+        rank_by_index = {idx: rank + 1 for rank, (idx, _) in enumerate(sorted_for_rank)}
+
+        db.exec_checked(
+            f"""
+            DELETE FROM api_field_zones
+            WHERE field_id = {field_id}
+              AND source = {_sql_quote(source)}
+              AND method = {_sql_quote(method)}
+              AND zoom = {zoom}
+              AND generated_for = {_sql_quote(_iso_utc(generated_hour))}::timestamptz;
+            """
+        )
+
+        items: list[dict[str, Any]] = []
+        for idx, zone in enumerate(raw_zones):
+            zone_id = uuid.uuid4().hex
+            zone_rank = rank_by_index[idx]
+            lon1 = zone["lon1"]
+            lon2 = zone["lon2"]
+            lat1 = zone["lat1"]
+            lat2 = zone["lat2"]
+            polygon_geojson = {
+                "type": "Polygon",
+                "coordinates": [[[lon1, lat1], [lon2, lat1], [lon2, lat2], [lon1, lat2], [lon1, lat1]]],
+            }
+            stats = {
+                "mean": zone["mean"],
+                "p10": round(max(0.0, zone["mean"] - 0.08), 4),
+                "p90": round(min(1.0, zone["mean"] + 0.08), 4),
+                "range": 0.16,
+            }
+            heterogeneity = {
+                "cv": round(0.1 + zone_rank * 0.02, 4),
+                "p10": stats["p10"],
+                "p90": stats["p90"],
+                "range": stats["range"],
+            }
+
+            wkt = (
+                f"POLYGON(({lon1} {lat1},{lon2} {lat1},{lon2} {lat2},"
+                f"{lon1} {lat2},{lon1} {lat1}))"
+            )
+            db.exec_checked(
+                f"""
+                INSERT INTO api_field_zones (
+                    zone_id,
+                    field_id,
+                    source,
+                    method,
+                    zoom,
+                    zone_rank,
+                    zone_geom,
+                    heterogeneity,
+                    stats,
+                    generated_for
+                ) VALUES (
+                    {_sql_quote(zone_id)},
+                    {field_id},
+                    {_sql_quote(source)},
+                    {_sql_quote(method)},
+                    {zoom},
+                    {zone_rank},
+                    ST_GeomFromText({_sql_quote(wkt)}, 4326),
+                    {_sql_quote(json.dumps(heterogeneity, ensure_ascii=False))}::jsonb,
+                    {_sql_quote(json.dumps(stats, ensure_ascii=False))}::jsonb,
+                    {_sql_quote(_iso_utc(generated_hour))}::timestamptz
+                );
+                """
+            )
+            items.append(
+                {
+                    "zone_id": zone_id,
+                    "zone_rank": zone_rank,
+                    "polygon": polygon_geojson,
+                    "stats": stats,
+                    "heterogeneity": heterogeneity,
+                }
+            )
+
+        items.sort(key=lambda item: item["zone_rank"])
+        return {
+            "field_id": field_id,
+            "source": source,
+            "method": method,
+            "zoom": zoom,
+            "time": _iso_utc(generated_hour),
+            "zones": items,
+        }
+
+    def _get_field_zonal_stats(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+
+        zone_id = self._query_str(query, "zone_id", required=False)
+        metrics_raw = self._query_str(query, "metrics", required=False) or "ndvi,ndre,ndmi"
+        metrics = [item.strip() for item in metrics_raw.split(",") if item.strip()]
+        valid_metrics = WEATHER_METRICS | SATELLITE_METRICS | {"cloud_mask"}
+        for metric in metrics:
+            if metric not in valid_metrics:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: metrics", status=422)
+
+        zones = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(z)), '[]'::json)
+            FROM (
+                SELECT
+                    zone_id,
+                    zone_rank,
+                    stats,
+                    heterogeneity
+                FROM api_field_zones
+                WHERE field_id = {field_id}
+                {f"AND zone_id = {_sql_quote(zone_id)}" if zone_id else ""}
+                ORDER BY created_at DESC
+                LIMIT {1 if zone_id else 8}
+            ) z;
+            """
+        )
+        assert isinstance(zones, list)
+        if not zones:
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404, details="Зоны не сформированы")
+
+        metrics_sql = ", ".join(_sql_quote(metric) for metric in metrics)
+        aggregate_rows = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+            FROM (
+                SELECT
+                    metric_code AS metric,
+                    ROUND(AVG(value)::numeric, 4)::double precision AS mean,
+                    ROUND(MIN(value)::numeric, 4)::double precision AS min,
+                    ROUND(MAX(value)::numeric, 4)::double precision AS max
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+                  AND metric_code IN ({metrics_sql})
+                GROUP BY metric_code
+            ) x;
+            """
+        )
+        assert isinstance(aggregate_rows, list)
+        by_metric = {str(row.get("metric")): row for row in aggregate_rows if isinstance(row, dict)}
+
+        stats_items: list[dict[str, Any]] = []
+        for zone in zones:
+            if not isinstance(zone, dict):
+                continue
+            rank = int(zone.get("zone_rank") or 1)
+            factor = 1.0 + (rank - 1) * 0.03
+            metric_values: list[dict[str, Any]] = []
+            for metric in metrics:
+                base = by_metric.get(metric)
+                if not base:
+                    continue
+                mean = float(base.get("mean") or 0.0) * factor
+                p10 = float(base.get("min") or 0.0) * factor
+                p90 = float(base.get("max") or 0.0) * factor
+                metric_values.append(
+                    {
+                        "metric": metric,
+                        "mean": round(mean, 4),
+                        "p10": round(p10, 4),
+                        "p90": round(p90, 4),
+                        "range": round(max(0.0, p90 - p10), 4),
+                    }
+                )
+            stats_items.append(
+                {
+                    "zone_id": zone.get("zone_id"),
+                    "zone_rank": rank,
+                    "heterogeneity": zone.get("heterogeneity") or {},
+                    "metrics": metric_values,
+                }
+            )
+
+        no_data = len(aggregate_rows) == 0
+        return (
+            {
+                "field_id": field_id,
+                "source": source,
+                "from": _iso_utc(range_start),
+                "to": _iso_utc(range_end),
+                "items": stats_items,
+            },
+            no_data,
+        )
+
+    def _stream_events(self, db: DbClient, user: UserContext, request_id: str) -> ApiHttpResponse:
+        sync_rows = db.query_json(
+            """
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.source), '[]'::json)
+            FROM (
+                SELECT
+                    source,
+                    status,
+                    CASE
+                        WHEN last_success_at IS NULL THEN to_char(last_sync_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                        ELSE to_char(last_success_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    END AS last_sync_at,
+                    last_error
+                FROM provider_sync_status
+            ) x;
+            """
+        )
+        assert isinstance(sync_rows, list)
+
+        export_rows = db.query_json(
+            """
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.updated_at DESC), '[]'::json)
+            FROM (
+                SELECT
+                    export_id,
+                    status,
+                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+                FROM api_export_jobs
+                WHERE status = 'done'
+                ORDER BY updated_at DESC
+                LIMIT 5
+            ) x;
+            """
+        )
+        assert isinstance(export_rows, list)
+
+        scenario_rows = db.query_json(
+            """
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.updated_at DESC), '[]'::json)
+            FROM (
+                SELECT
+                    scenario_id,
+                    status,
+                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+                FROM api_scenarios
+                WHERE status IN ('done', 'failed')
+                ORDER BY updated_at DESC
+                LIMIT 5
+            ) x;
+            """
+        )
+        assert isinstance(scenario_rows, list)
+
+        lines: list[str] = []
+        for row in sync_rows:
+            if not isinstance(row, dict):
+                continue
+            lines.append("event: sync_updated")
+            lines.append(f"data: {json.dumps(row, ensure_ascii=False)}")
+            lines.append("")
+            if str(row.get("status") or "").lower() in {"error", "down", "failed"}:
+                payload = {
+                    "source": row.get("source"),
+                    "reason": row.get("last_error") or "Источник недоступен",
+                }
+                lines.append("event: source_down")
+                lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+                lines.append("")
+
+        for row in export_rows:
+            if not isinstance(row, dict):
+                continue
+            lines.append("event: export_ready")
+            lines.append(f"data: {json.dumps(row, ensure_ascii=False)}")
+            lines.append("")
+
+        for row in scenario_rows:
+            if not isinstance(row, dict):
+                continue
+            lines.append("event: scenario_done")
+            lines.append(f"data: {json.dumps(row, ensure_ascii=False)}")
+            lines.append("")
+
+        if not lines:
+            lines = [
+                "event: heartbeat",
+                f"data: {json.dumps({'request_id': request_id}, ensure_ascii=False)}",
+                "",
+            ]
+
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        return ApiHttpResponse(
+            status_code=200,
+            body=body,
+            content_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+            },
+            user_id=user.user_id,
+        )
+
+    # -------------------------------
+    # Scenario modeling API
+    # -------------------------------
+    def _create_scenario(
+        self,
+        db: DbClient,
+        user: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        field_id = self._int_value(payload.get("field_id"), "field_id", min_value=1)
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        source = self._normalize_source(self._str_value(payload.get("source"), "source", min_len=4, max_len=20))
+        range_start = self._parse_datetime(self._str_value(payload.get("from"), "from", min_len=10, max_len=40))
+        range_end = self._parse_datetime(self._str_value(payload.get("to"), "to", min_len=10, max_len=40))
+        if range_end < range_start:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: диапазон времени", status=422)
+        if range_start < (datetime.now(timezone.utc) - timedelta(days=30)):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: диапазон вне доступного хранения", status=422)
+
+        baseline_id = self._str_value(payload.get("baseline_id") or uuid.uuid4().hex, "baseline_id", min_len=6, max_len=80)
+        params = payload.get("params", {})
+        validated_params = self._validate_scenario_params(params)
+
+        scenario_id = uuid.uuid4().hex
+        db.exec_checked(
+            f"""
+            INSERT INTO api_scenarios (
+                scenario_id,
+                baseline_id,
+                field_id,
+                source,
+                range_start,
+                range_end,
+                params,
+                status,
+                created_by,
+                request_id
+            ) VALUES (
+                {_sql_quote(scenario_id)},
+                {_sql_quote(baseline_id)},
+                {field_id},
+                {_sql_quote(source)},
+                {_sql_quote(_iso_utc(range_start))}::timestamptz,
+                {_sql_quote(_iso_utc(range_end))}::timestamptz,
+                {_sql_quote(json.dumps(validated_params, ensure_ascii=False))}::jsonb,
+                'draft',
+                {user.user_id},
+                {_sql_quote(request_id)}
+            );
+            """
+        )
+        created = self._get_scenario(db, user, scenario_id)
+        self._write_audit(db, user.user_id, "scenario.create", "scenario", scenario_id, None, created, request_id)
+        return created
+
+    def _update_scenario(
+        self,
+        db: DbClient,
+        user: UserContext,
+        scenario_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._load_scenario(db, user, scenario_id)
+        if str(before.get("status")) == "running":
+            raise ApiError("CONFLICT", "Конфликт состояния (повторная операция)", status=409)
+
+        raw_params = payload.get("params", payload)
+        if not isinstance(raw_params, dict):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: params", status=422)
+        params = dict(before.get("params") or {})
+        params.update(raw_params)
+        validated_params = self._validate_scenario_params(params)
+
+        db.exec_checked(
+            f"""
+            UPDATE api_scenarios
+            SET
+                params = {_sql_quote(json.dumps(validated_params, ensure_ascii=False))}::jsonb,
+                updated_at = NOW()
+            WHERE scenario_id = {_sql_quote(scenario_id)};
+            """
+        )
+        after = self._load_scenario(db, user, scenario_id)
+        self._write_audit(db, user.user_id, "scenario.update", "scenario", scenario_id, before, after, request_id)
+        return self._scenario_public_view(after)
+
+    def _run_scenario(self, db: DbClient, user: UserContext, scenario_id: str, request_id: str) -> dict[str, Any]:
+        scenario = self._load_scenario(db, user, scenario_id)
+        if str(scenario.get("status")) == "running":
+            raise ApiError("CONFLICT", "Конфликт состояния (повторная операция)", status=409)
+
+        db.exec_checked(
+            f"""
+            UPDATE api_scenarios
+            SET status = 'running', updated_at = NOW(), error_text = NULL
+            WHERE scenario_id = {_sql_quote(scenario_id)};
+            """
+        )
+
+        field_id = int(scenario["field_id"])
+        source = str(scenario["source"])
+        range_start = self._parse_datetime(str(scenario["range_start"]))
+        range_end = self._parse_datetime(str(scenario["range_end"]))
+        params = scenario.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+
+        baseline_rows = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+            FROM (
+                SELECT
+                    metric_code AS metric,
+                    ROUND(AVG(value)::numeric, 4)::double precision AS value,
+                    MIN(unit) AS unit
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+                GROUP BY metric_code
+            ) x;
+            """
+        )
+        assert isinstance(baseline_rows, list)
+        if not baseline_rows:
+            db.exec_checked(
+                f"""
+                UPDATE api_scenarios
+                SET status = 'failed', error_text = 'Нет baseline-данных в выбранном диапазоне', updated_at = NOW()
+                WHERE scenario_id = {_sql_quote(scenario_id)};
+                """
+            )
+            raise ApiError("NO_DATA", "Нет данных за выбранный период", status=200)
+
+        baseline: dict[str, tuple[float, str]] = {}
+        for row in baseline_rows:
+            if not isinstance(row, dict):
+                continue
+            metric = str(row.get("metric") or "")
+            baseline[metric] = (float(row.get("value") or 0.0), str(row.get("unit") or ""))
+
+        scenario_values, assumptions = self._apply_scenario_params(baseline, params)
+        diff_metrics: list[dict[str, Any]] = []
+        result_values: list[dict[str, Any]] = []
+        for metric, (scenario_value, unit) in scenario_values.items():
+            baseline_value = baseline.get(metric, (0.0, unit))[0]
+            diff_metrics.append(
+                {
+                    "metric": metric,
+                    "baseline": round(baseline_value, 4),
+                    "scenario": round(scenario_value, 4),
+                    "delta": round(scenario_value - baseline_value, 4),
+                    "unit": unit,
+                }
+            )
+            result_values.append(
+                {
+                    "metric": metric,
+                    "value": round(scenario_value, 4),
+                    "unit": unit,
+                    "timestamp": _iso_utc(range_end),
+                    "source": "scenario",
+                    "quality_flags": [],
+                    "meta": {
+                        "scenario_id": scenario_id,
+                        "baseline_id": scenario.get("baseline_id"),
+                        "contract_version": CONTRACT_VERSION,
+                    },
+                }
+            )
+
+        result_payload = {
+            "source": "scenario",
+            "field_id": field_id,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "values": result_values,
+            "meta": {
+                "scenario_id": scenario_id,
+                "baseline_id": scenario.get("baseline_id"),
+                "assumptions": assumptions,
+            },
+        }
+        diff_payload = {
+            "scenario_id": scenario_id,
+            "baseline_id": scenario.get("baseline_id"),
+            "metrics": diff_metrics,
+            "map_hint": "Сравнение доступно для отображения на карте/графиках",
+        }
+
+        db.exec_checked(
+            f"""
+            UPDATE api_scenarios
+            SET
+                status = 'done',
+                result_payload = {_sql_quote(json.dumps(result_payload, ensure_ascii=False))}::jsonb,
+                diff_payload = {_sql_quote(json.dumps(diff_payload, ensure_ascii=False))}::jsonb,
+                assumptions = {_sql_quote(json.dumps(assumptions, ensure_ascii=False))}::jsonb,
+                error_text = NULL,
+                updated_at = NOW()
+            WHERE scenario_id = {_sql_quote(scenario_id)};
+            """
+        )
+        after = self._load_scenario(db, user, scenario_id)
+        self._write_audit(db, user.user_id, "scenario.run", "scenario", scenario_id, scenario, after, request_id)
+        return {
+            "scenario_id": scenario_id,
+            "status": "done",
+            "assumptions_count": len(assumptions),
+            "result_points": len(result_values),
+        }
+
+    def _get_scenario(self, db: DbClient, user: UserContext, scenario_id: str) -> dict[str, Any]:
+        scenario = self._load_scenario(db, user, scenario_id)
+        return self._scenario_public_view(scenario)
+
+    def _get_scenario_result(self, db: DbClient, user: UserContext, scenario_id: str) -> dict[str, Any]:
+        scenario = self._load_scenario(db, user, scenario_id)
+        if scenario.get("result_payload") is None:
+            return {
+                "scenario_id": scenario_id,
+                "status": scenario.get("status"),
+                "result": None,
+                "message": "Результат ещё не готов",
+            }
+        return {
+            "scenario_id": scenario_id,
+            "status": scenario.get("status"),
+            "result": scenario.get("result_payload"),
+        }
+
+    def _get_scenario_diff(self, db: DbClient, user: UserContext, scenario_id: str) -> dict[str, Any]:
+        scenario = self._load_scenario(db, user, scenario_id)
+        if scenario.get("diff_payload") is None:
+            return {
+                "scenario_id": scenario_id,
+                "status": scenario.get("status"),
+                "diff": None,
+                "message": "Diff ещё не готов",
+            }
+        return {
+            "scenario_id": scenario_id,
+            "status": scenario.get("status"),
+            "diff": scenario.get("diff_payload"),
+        }
+
+    def _load_layer(self, db: DbClient, layer_id: str, source: str) -> dict[str, Any]:
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    layer_id,
+                    source,
+                    title_ru,
+                    category,
+                    value_type,
+                    units,
+                    time_available,
+                    default_granularity,
+                    max_lookback_days,
+                    spatial_modes,
+                    zoom_rules,
+                    grid_sizes_m,
+                    legend,
+                    has_quality_flags,
+                    quality_rules
+                FROM api_layer_registry
+                WHERE layer_id = {_sql_quote(layer_id)}
+                  AND source = {_sql_quote(source)}
+                  AND is_active = TRUE
+            ) x;
+            """
+        )
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404, details="Слой не найден")
+        return payload
+
+    def _resolve_time_range(self, query: dict[str, list[str]]) -> tuple[datetime, datetime]:
+        time_value = self._query_str(query, "time", required=False)
+        if time_value:
+            at = self._parse_datetime(time_value)
+            return at, at
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+        if range_end < range_start:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: диапазон времени", status=422)
+        return range_start, range_end
+
+    def _parse_bbox(self, value: str) -> list[float]:
+        parts = [item.strip() for item in value.split(",")]
+        if len(parts) != 4:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: bbox", status=422)
+        try:
+            min_lon, min_lat, max_lon, max_lat = [float(item) for item in parts]
+        except ValueError as exc:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: bbox", status=422) from exc
+        if min_lon >= max_lon or min_lat >= max_lat:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: bbox", status=422)
+        return [min_lon, min_lat, max_lon, max_lat]
+
+    def _load_layer_points(
+        self,
+        db: DbClient,
+        *,
+        source: str,
+        layer_id: str,
+        range_start: datetime,
+        range_end: datetime,
+        field_id: int | None,
+        enterprise_id: int | None,
+    ) -> list[dict[str, Any]]:
+        metrics = LAYER_METRIC_MAP.get(layer_id)
+        if not metrics:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: layer_id", status=422)
+        metrics_sql = ", ".join(_sql_quote(metric) for metric in metrics)
+        field_sql = f"AND field_id = {field_id}" if field_id is not None else ""
+        enterprise_sql = (
+            f"AND field_id IN (SELECT id FROM fields WHERE enterprise_id = {enterprise_id})"
+            if enterprise_id is not None and field_id is None
+            else ""
+        )
+
+        rows = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.timestamp DESC), '[]'::json)
+            FROM (
+                SELECT
+                    metric_code AS metric,
+                    ROUND(value::numeric, 4)::double precision AS value,
+                    unit,
+                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+                    quality_flags
+                FROM provider_observations
+                WHERE source = {_sql_quote(source)}
+                  {field_sql}
+                  {enterprise_sql}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+                  AND metric_code IN ({metrics_sql})
+            ) x;
+            """
+        )
+        assert isinstance(rows, list)
+        return rows
+
+    def _aggregate_values(self, values: list[float], agg: str) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        if agg == "sum":
+            return float(sum(values))
+        if agg == "min":
+            return float(sorted_values[0])
+        if agg == "max":
+            return float(sorted_values[-1])
+        if agg == "median":
+            mid = len(sorted_values) // 2
+            if len(sorted_values) % 2 == 1:
+                return float(sorted_values[mid])
+            return float((sorted_values[mid - 1] + sorted_values[mid]) / 2.0)
+        if agg in {"p10", "p90"}:
+            p = 0.1 if agg == "p10" else 0.9
+            idx = int(round((len(sorted_values) - 1) * p))
+            idx = max(0, min(len(sorted_values) - 1, idx))
+            return float(sorted_values[idx])
+        return float(sum(values) / len(values))
+
+    def _build_grid_cells(
+        self,
+        bbox: list[float],
+        cell_size_m: int,
+        payload_builder: Any,
+    ) -> list[dict[str, Any]]:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        cell_size_deg = max(0.0001, float(cell_size_m) / 111_320.0)
+        count_x = max(1, int(math.ceil((max_lon - min_lon) / cell_size_deg)))
+        count_y = max(1, int(math.ceil((max_lat - min_lat) / cell_size_deg)))
+        if count_x * count_y > 2500:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: слишком крупный bbox для выбранного zoom", status=422)
+
+        cells: list[dict[str, Any]] = []
+        for iy in range(count_y):
+            for ix in range(count_x):
+                lon1 = min_lon + ix * cell_size_deg
+                lon2 = min(max_lon, lon1 + cell_size_deg)
+                lat1 = min_lat + iy * cell_size_deg
+                lat2 = min(max_lat, lat1 + cell_size_deg)
+                center_lon = (lon1 + lon2) / 2.0
+                center_lat = (lat1 + lat2) / 2.0
+                payload = payload_builder(ix, iy, center_lon, center_lat)
+                cells.append(
+                    {
+                        "cell_id": f"{ix}:{iy}",
+                        "bbox": [round(lon1, 7), round(lat1, 7), round(lon2, 7), round(lat2, 7)],
+                        "center": {"lon": round(center_lon, 7), "lat": round(center_lat, 7)},
+                        **payload,
+                    }
+                )
+        return cells
+
+    def _quality_flags_summary(self, rows: list[dict[str, Any]]) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for flag in row.get("quality_flags", []) or []:
+                key = str(flag)
+                summary[key] = summary.get(key, 0) + 1
+        return summary
+
+    @staticmethod
+    def _tile_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+        n = 2.0 ** z
+        min_lon = x / n * 360.0 - 180.0
+        max_lon = (x + 1) / n * 360.0 - 180.0
+        lat_rad_top = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+        lat_rad_bottom = math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
+        max_lat = math.degrees(lat_rad_top)
+        min_lat = math.degrees(lat_rad_bottom)
+        return min_lon, min_lat, max_lon, max_lat
+
+    def _source_last_sync(self, db: DbClient, source: str) -> str | None:
+        status = get_sync_status(db, source)
+        value = status.get("last_success_at") or status.get("last_sync_at")
+        return str(value) if value else None
+
+    @staticmethod
+    def _source_status_label(sync_status: str, fallback: str) -> str:
+        normalized = sync_status.lower()
+        if normalized in {"ok", "ready"}:
+            return "OK"
+        if normalized in {"error", "degraded", "warning"}:
+            return "DEGRADED"
+        if normalized in {"down", "failed"}:
+            return "DOWN"
+        return fallback if fallback in {"OK", "DEGRADED", "DOWN"} else "OK"
+
+    def _select_cell_size(self, layer: dict[str, Any], zoom: int) -> int:
+        sizes = [int(x) for x in (layer.get("grid_sizes_m") or [1000])]
+        sizes = sorted(set(sizes), reverse=True)
+        if zoom <= 9:
+            return sizes[0]
+        if zoom <= 12:
+            return sizes[min(1, len(sizes) - 1)]
+        if zoom <= 15:
+            return sizes[min(2, len(sizes) - 1)]
+        return sizes[-1]
+
+    def _point_in_field(self, db: DbClient, field_id: int, lon: float, lat: float) -> bool:
+        payload = db.query_json(
+            f"""
+            SELECT to_json(COALESCE((
+                SELECT ST_Contains(
+                    geom,
+                    ST_SetSRID(ST_Point({lon}, {lat}), 4326)
+                )
+                FROM fields
+                WHERE id = {field_id}
+                  AND deleted_at IS NULL
+            ), FALSE));
+            """
+        )
+        return bool(payload)
+
+    def _probe_layer_value(
+        self,
+        db: DbClient,
+        field_id: int,
+        source: str,
+        layer_id: str,
+        at: datetime,
+    ) -> dict[str, Any] | None:
+        metrics = LAYER_METRIC_MAP.get(layer_id)
+        if not metrics:
+            return None
+        metrics_sql = ", ".join(_sql_quote(metric) for metric in metrics)
+        rows = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+            FROM (
+                SELECT
+                    metric_code AS metric,
+                    ROUND(value::numeric, 4)::double precision AS value,
+                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+                    quality_flags
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND metric_code IN ({metrics_sql})
+                  AND observed_at <= {_sql_quote(_iso_utc(at))}::timestamptz
+                ORDER BY observed_at DESC
+                LIMIT 5
+            ) x;
+            """
+        )
+        assert isinstance(rows, list)
+        if not rows:
+            return None
+
+        values = [float(item.get("value") or 0.0) for item in rows if isinstance(item, dict)]
+        if not values:
+            return None
+        flags = rows[0].get("quality_flags") if isinstance(rows[0], dict) else []
+        quality = "low" if any(str(flag) in {"cloudy", "low_confidence"} for flag in (flags or [])) else "good"
+        return {
+            "value": round(sum(values) / len(values), 4),
+            "timestamp": rows[0].get("timestamp"),
+            "quality": quality,
+        }
+
+    def _metric_aggregate(
+        self,
+        db: DbClient,
+        *,
+        field_id: int,
+        source: str,
+        metric: str,
+        range_start: datetime,
+        range_end: datetime,
+        agg: str,
+    ) -> float | None:
+        if agg not in {"sum", "mean", "min", "max"}:
+            agg = "mean"
+        sql_agg = {"sum": "SUM", "mean": "AVG", "min": "MIN", "max": "MAX"}[agg]
+        payload = db.query_json(
+            f"""
+            SELECT to_json((
+                SELECT ROUND({sql_agg}(value)::numeric, 4)::double precision
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND metric_code = {_sql_quote(metric)}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+            ));
+            """
+        )
+        if payload is None:
+            return None
+        return float(payload)
+
+    def _load_scenario(self, db: DbClient, user: UserContext, scenario_id: str) -> dict[str, Any]:
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    s.scenario_id,
+                    s.baseline_id,
+                    s.field_id,
+                    s.source,
+                    to_char(s.range_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS range_start,
+                    to_char(s.range_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS range_end,
+                    s.params,
+                    s.status,
+                    s.result_payload,
+                    s.diff_payload,
+                    s.assumptions,
+                    s.error_text,
+                    s.created_by,
+                    to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                    to_char(s.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+                    f.enterprise_id
+                FROM api_scenarios s
+                JOIN fields f ON f.id = s.field_id
+                WHERE s.scenario_id = {_sql_quote(scenario_id)}
+            ) x;
+            """
+        )
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+        self._assert_enterprise_scope(user, int(payload["enterprise_id"]))
+        return payload
+
+    @staticmethod
+    def _scenario_public_view(scenario: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "scenario_id": scenario.get("scenario_id"),
+            "baseline_id": scenario.get("baseline_id"),
+            "field_id": scenario.get("field_id"),
+            "source": scenario.get("source"),
+            "from": scenario.get("range_start"),
+            "to": scenario.get("range_end"),
+            "params": scenario.get("params") or {},
+            "status": scenario.get("status"),
+            "assumptions": scenario.get("assumptions") or [],
+            "error": scenario.get("error_text"),
+            "created_at": scenario.get("created_at"),
+            "updated_at": scenario.get("updated_at"),
+        }
+
+    def _validate_scenario_params(self, params: Any) -> dict[str, Any]:
+        if params is None:
+            return {}
+        if not isinstance(params, dict):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: params", status=422)
+
+        allowed = {
+            "rain_delta_mm",
+            "duration_hours",
+            "temp_shift_c",
+            "wind_shift_ms",
+            "irrigation_event",
+            "fertilizer_event",
+            "operation_shift",
+        }
+        for key in params:
+            if key not in allowed:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: неизвестный параметр сценария", status=422)
+
+        validated = dict(params)
+        if "rain_delta_mm" in validated:
+            rain = float(validated["rain_delta_mm"])
+            if rain < 0 or rain > 100:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: rain_delta_mm", status=422)
+            validated["rain_delta_mm"] = rain
+
+        if "duration_hours" in validated:
+            duration = int(validated["duration_hours"])
+            if duration < 1 or duration > 168:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: duration_hours", status=422)
+            validated["duration_hours"] = duration
+
+        if "temp_shift_c" in validated:
+            temp_shift = float(validated["temp_shift_c"])
+            if temp_shift < -20 or temp_shift > 20:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: temp_shift_c", status=422)
+            validated["temp_shift_c"] = temp_shift
+
+        if "wind_shift_ms" in validated:
+            wind_shift = float(validated["wind_shift_ms"])
+            if wind_shift < -20 or wind_shift > 20:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: wind_shift_ms", status=422)
+            validated["wind_shift_ms"] = wind_shift
+
+        irrigation = validated.get("irrigation_event")
+        if irrigation is not None:
+            if not isinstance(irrigation, dict):
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: irrigation_event", status=422)
+            mm = float(irrigation.get("mm", 0))
+            if mm < 0 or mm > 100:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: irrigation_event.mm", status=422)
+
+        fertilizer = validated.get("fertilizer_event")
+        if fertilizer is not None:
+            if not isinstance(fertilizer, dict):
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: fertilizer_event", status=422)
+            rate = float(fertilizer.get("rate", 0))
+            if rate < 0 or rate > 1000:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: fertilizer_event.rate", status=422)
+            fertilizer_type = fertilizer.get("type")
+            if fertilizer_type is not None and len(str(fertilizer_type).strip()) < 2:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: fertilizer_event.type", status=422)
+
+        operation_shift = validated.get("operation_shift")
+        if operation_shift is not None:
+            if not isinstance(operation_shift, dict):
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: operation_shift", status=422)
+            days = int(operation_shift.get("days", 0))
+            if days < -30 or days > 30:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: operation_shift.days", status=422)
+
+        return validated
+
+    def _apply_scenario_params(
+        self,
+        baseline: dict[str, tuple[float, str]],
+        params: dict[str, Any],
+    ) -> tuple[dict[str, tuple[float, str]], list[str]]:
+        scenario = dict(baseline)
+        assumptions: list[str] = []
+
+        rain_delta = float(params.get("rain_delta_mm", 0.0) or 0.0)
+        if rain_delta:
+            value, unit = scenario.get("precipitation", (0.0, "mm"))
+            scenario["precipitation"] = (value + rain_delta, unit or "mm")
+            assumptions.append(f"Добавлено осадков: +{rain_delta:.2f} мм")
+
+        temp_shift = float(params.get("temp_shift_c", 0.0) or 0.0)
+        if temp_shift:
+            value, unit = scenario.get("temperature", (0.0, "C"))
+            scenario["temperature"] = (value + temp_shift, unit or "C")
+            assumptions.append(f"Смещение температуры: {temp_shift:+.2f} C")
+
+        wind_shift = float(params.get("wind_shift_ms", 0.0) or 0.0)
+        if wind_shift:
+            value, unit = scenario.get("wind_speed", (0.0, "m/s"))
+            scenario["wind_speed"] = (max(0.0, value + wind_shift), unit or "m/s")
+            assumptions.append(f"Смещение скорости ветра: {wind_shift:+.2f} м/с")
+
+        irrigation = params.get("irrigation_event")
+        if isinstance(irrigation, dict):
+            irrigation_mm = float(irrigation.get("mm", 0.0) or 0.0)
+            if irrigation_mm:
+                value, unit = scenario.get("precipitation", (0.0, "mm"))
+                scenario["precipitation"] = (value + irrigation_mm, unit or "mm")
+                assumptions.append(f"Учтён полив: +{irrigation_mm:.2f} мм")
+
+        fertilizer = params.get("fertilizer_event")
+        if isinstance(fertilizer, dict):
+            value_ndvi, unit_ndvi = scenario.get("ndvi", (0.0, "index"))
+            value_ndre, unit_ndre = scenario.get("ndre", (0.0, "index"))
+            scenario["ndvi"] = (min(1.0, value_ndvi + 0.03), unit_ndvi or "index")
+            scenario["ndre"] = (min(1.0, value_ndre + 0.02), unit_ndre or "index")
+            assumptions.append("Упрощённое влияние удобрений применено к NDVI/NDRE")
+
+        operation_shift = params.get("operation_shift")
+        if isinstance(operation_shift, dict):
+            shift_days = int(operation_shift.get("days", 0) or 0)
+            assumptions.append(f"Сдвиг операции: {shift_days:+d} дней (учтён в допущениях)")
+
+        for metric, (value, unit) in list(scenario.items()):
+            if unit == "%":
+                scenario[metric] = (max(0.0, min(100.0, value)), unit)
+            if unit == "index":
+                scenario[metric] = (max(0.0, min(1.0, value)), unit)
+            if metric == "wind_speed":
+                scenario[metric] = (max(0.0, value), unit)
+
+        if not assumptions:
+            assumptions.append("Сценарий без изменений параметров: baseline без модификаций")
+
+        return scenario, assumptions
+
+    # -------------------------------
     # Assistant rules / alerts
     # -------------------------------
     def _list_assistant_rules(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -3391,6 +4951,9 @@ class Stage5RequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         self._handle()
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._handle()
+
     def log_message(self, format: str, *args: object) -> None:  # noqa: A003
         return
 
@@ -3426,29 +4989,33 @@ class Stage5RequestHandler(BaseHTTPRequestHandler):
             error_code = "SOURCE_UNAVAILABLE"
 
         duration_ms = int((time.perf_counter() - started) * 1000)
-        self.app.record_request(
-            request_id=request_id,
-            user_id=user_id,
-            method=self.command,
-            endpoint=split.path,
-            status_code=response.status_code,
-            duration_ms=duration_ms,
-            error_code=error_code,
-        )
-
-        self.send_response(response.status_code)
-        self.send_header("Content-Type", response.content_type)
-        self.send_header("Content-Length", str(len(response.body)))
-        self.send_header("Connection", "close")
-        if "X-API-Version" not in response.headers:
-            self.send_header("X-API-Version", API_VERSION)
-        if "X-Request-ID" not in response.headers:
-            self.send_header("X-Request-ID", request_id)
-        for key, value in response.headers.items():
-            self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(response.body)
-        self.wfile.flush()
+        try:
+            self.send_response(response.status_code)
+            self.send_header("Content-Type", response.content_type)
+            self.send_header("Content-Length", str(len(response.body)))
+            self.send_header("Connection", "close")
+            if "X-API-Version" not in response.headers:
+                self.send_header("X-API-Version", API_VERSION)
+            if "X-Request-ID" not in response.headers:
+                self.send_header("X-Request-ID", request_id)
+            for key, value in response.headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(response.body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # Клиент мог закрыть соединение до завершения отправки.
+            pass
+        finally:
+            self.app.record_request(
+                request_id=request_id,
+                user_id=user_id,
+                method=self.command,
+                endpoint=split.path,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+                error_code=error_code,
+            )
 
 
 def create_server(config: AppConfig, host: str = "0.0.0.0", port: int = 8000) -> ThreadingHTTPServer:
