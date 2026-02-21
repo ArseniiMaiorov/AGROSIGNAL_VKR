@@ -57,6 +57,12 @@ python3 scripts/stage4_cli.py metrics --admin-email admin.stage4@zemledar.local
 ./stage4_cli.py proxy-get --admin-email admin.stage4@zemledar.local
 ```
 
+Если нужен вызов без `./`, установите wrapper в `~/.local/bin`:
+```bash
+make install-cli
+stage4_cli.py proxy-get --admin-email admin.stage4@zemledar.local
+```
+
 Секреты proxy (логин/пароль/token) хранятся в переменных окружения или secret-store и не сохраняются в БД.
 Прокси применяется только к outbound-запросам модулей `providers/copernicus/*`, `providers/nasa/*`, `datasets/download/*`.
 Для операций чтения/изменения proxy-настроек, журналов и метрик требуется роль `admin`.

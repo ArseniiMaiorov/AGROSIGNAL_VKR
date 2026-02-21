@@ -6,7 +6,7 @@ API_MODE_FILE := .api_mode
 SCHEDULER_PID_FILE := .scheduler.pid
 SCHEDULER_LOG_FILE := .scheduler.log
 
-.PHONY: build up down ps logs lint test migrate test-stage2 test-stage3 test-stage4 quality print-port stage3-sync stage3-cycle stage4-admin stage4-proxy-get stage4-health stage4-metrics stage4-request-log
+.PHONY: build up down ps logs lint test migrate test-stage2 test-stage3 test-stage4 quality print-port stage3-sync stage3-cycle stage4-admin stage4-proxy-get stage4-health stage4-metrics stage4-request-log install-cli
 
 build:
 	$(COMPOSE) build api
@@ -168,6 +168,12 @@ stage4-request-log:
 		exit 1; \
 	fi; \
 	python3 scripts/stage4_cli.py request-log --request-id "$$REQUEST_ID" --admin-email "$${ADMIN_EMAIL:-admin.stage4@zemledar.local}"
+
+install-cli:
+	@mkdir -p "$$HOME/.local/bin"
+	@ln -sf "$$(cd .. && pwd)/stage4_cli.py" "$$HOME/.local/bin/stage4_cli.py"
+	@chmod +x "$$HOME/.local/bin/stage4_cli.py"
+	@echo "Установлено: $$HOME/.local/bin/stage4_cli.py"
 
 print-port:
 	@if [ -f .api_port ]; then \
