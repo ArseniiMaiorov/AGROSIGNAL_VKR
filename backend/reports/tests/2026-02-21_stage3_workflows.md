@@ -6,7 +6,7 @@
 Ожидаемый результат:
   - Обновлены last_sync_at/last_success_at и данные доступны
 Фактический результат:
-  - Copernicus: status=ok, last_success_at=2026-02-21T02:48:26Z; NASA: status=ok, last_success_at=2026-02-21T02:48:31Z; Mock: status=ok, last_success_at=2026-02-21T02:48:37Z
+  - Copernicus: status=ok, last_success_at=2026-02-21T03:17:20Z; NASA: status=ok, last_success_at=2026-02-21T03:17:26Z; Mock: status=ok, last_success_at=2026-02-21T03:17:31Z
 Статус: PASS
 
 Фича: Drill-down по временной шкале
@@ -15,7 +15,7 @@
 Ожидаемый результат:
   - Сводка + bins desc на каждом уровне и точечная статистика на часе
 Фактический результат:
-  - month_bins=2, day_bins=21, hour_bins=3, point_records=5
+  - month_bins=2, day_bins=21, hour_bins=4, point_records=5
 Статус: PASS
 
 Фича: Экспорт данных по диапазону
@@ -24,7 +24,7 @@
 Ожидаемый результат:
   - Создана задача, сформирован файл, статус ready
 Фактический результат:
-  - dataset_id=b784332aebe64f8cb1be3afc5ba9f9ce, status=ready, file=exports/b784332aebe64f8cb1be3afc5ba9f9ce.json
+  - dataset_id=c687716ad0dc4706b241392a9f4fed29, status=ready, file=exports/c687716ad0dc4706b241392a9f4fed29.json
 Статус: PASS
 
 Фича: TTL и предупреждение

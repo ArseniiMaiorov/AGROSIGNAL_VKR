@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0] - 2026-02-21
+### Добавлено
+- Этап 4: proxy-контур загрузчиков датасетов Copernicus/NASA/Mock.
+- Таблицы `proxy_settings`, `provider_sync_journal`, `proxy_request_logs`.
+- Безопасная схема хранения proxy-секретов: креды читаются из env, в БД хранятся только флаги и endpoint без секретов.
+- Режимы `global`/`per_provider`, поддержка `bypass_hosts` и `bypass_policy`.
+- Health-check proxy/source с записью `last_check_*` и `source_reachability`.
+- Политика ретраев и классификация ошибок (`timeout/dns/tls/auth/http/network`).
+- Наблюдаемость: структурные логи запросов и агрегированные метрики.
+- Режим деградации для UI при недоступности источника.
+- Команды `stage4_cli.py` и тестовый набор `make test-stage4`.
+
 ## [0.3.0] - 2026-02-21
 ### Добавлено
 - Этап 3: единый контракт данных и режимы провайдеров Copernicus/NASA/Mock.

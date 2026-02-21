@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f docker-compose.yml
 
-.PHONY: build up down ps logs lint test migrate test-stage2 test-stage3 print-port stage3-sync stage3-cycle
+.PHONY: build up down ps logs lint test migrate test-stage2 test-stage3 test-stage4 print-port stage3-sync stage3-cycle
 
 build:
 	$(COMPOSE) build api
@@ -36,6 +36,9 @@ test-stage2: migrate
 
 test-stage3: migrate
 	python3 scripts/test_stage3_workflows.py
+
+test-stage4: migrate
+	python3 scripts/test_stage4_proxy.py
 
 stage3-sync: migrate
 	python3 scripts/stage3_cli.py sync --source Copernicus --hours 72

@@ -45,3 +45,31 @@
 Проверка:
 - `make test-stage3` — PASS: sync, drill-down, export, ttl.
 - Формируется протокол: `backend/reports/tests/<дата>_stage3_workflows.md`.
+
+## 2026-02-21 — Этап 4: Proxy-контур загрузчиков, health-check, ретраи, наблюдаемость
+
+Сделано:
+- Введена настройка proxy в БД (`proxy_settings`) с RBAC-ограничением только для роли `admin`.
+- Формализована область действия proxy: только модули `providers/copernicus/*`, `providers/nasa/*`, `datasets/download/*`.
+- Добавлены режимы маршрутизации:
+  - `global` (общий proxy);
+  - `per_provider` (Copernicus/NASA по отдельности);
+  - `bypass_hosts` + политика `direct/force_proxy`.
+- Реализован health-check:
+  - проверка доступности proxy (TCP + TLS handshake для https endpoint);
+  - проверка доступности источника лёгким запросом;
+  - запись `last_check_*` и `source_reachability`.
+- Реализована политика ретраев:
+  - retry для `timeout`, `429`, `502`, `503`, `504`;
+  - без retry для `401/403` и остальных `4xx`;
+  - backoff + jitter, ограничение количества попыток.
+- Добавлены структурные журналы и метрики:
+  - `proxy_request_logs` (request_id/provider/proxy_used/http_status/duration/error_class/retry_count и т.д.);
+  - агрегация метрик по провайдерам и классам ошибок.
+- Добавлен режим деградации:
+  - при ошибке источник помечается недоступным;
+  - сохраняются причина и данные последней успешной синхронизации.
+
+Проверка:
+- `make test-stage4` — PASS: 401/auth, DNS, TLS, 429+retry, per-provider, bypass, логирование `proxy_used`, health-check.
+- Формируется протокол: `backend/reports/tests/<дата>_stage4_proxy.md`.

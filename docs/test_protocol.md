@@ -20,3 +20,16 @@
    - TTL (предупреждение за 1 день, продление, повторный просмотр dataset).
 2. Формируется отчёт:
    - `backend/reports/tests/<дата>_stage3_workflows.md`.
+
+## Этап 4
+1. `make test-stage4` — проверяются сценарии:
+   - Proxy ON + 401 (неверные креды) -> FAIL без ретраев;
+   - Proxy ON + DNS/TLS ошибки -> FAIL с корректным `error_class`;
+   - Proxy ON + 429 -> ретраи по backoff и успех/контролируемый FAIL;
+   - `per_provider` режим (Copernicus через proxy, NASA напрямую);
+   - `bypass_hosts` (домен из списка идёт напрямую при proxy ON);
+   - корректная фиксация `proxy_used=true/false` в журнале;
+   - health-check возвращает статус proxy/source и время проверки;
+   - деградационный статус источника содержит понятную причину.
+2. Формируется отчёт:
+   - `backend/reports/tests/<дата>_stage4_proxy.md`.
