@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+.env
+node_modules/
+dist/
+.~lock*
