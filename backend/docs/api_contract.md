@@ -1,6 +1,8 @@
-# API контракт (этапы 1-2)
+# API/режимы backend (этапы 1-3)
 
-## GET /health
+## HTTP endpoint
+
+### GET /health
 
 Назначение:
 - Проверка доступности API и базовой конфигурации окружения.
@@ -15,13 +17,28 @@
 }
 ```
 
-Поля:
-- `status`: строка, текущий статус (`ok`).
-- `service`: строка, имя сервиса.
-- `environment`: строка, имя окружения (`dev`, `prod`, ...).
-- `timestamp`: ISO-8601 время ответа в UTC.
+## Режимы backend (этап 3)
 
-## Примечание по этапу 2
+Режимы реализованы через `scripts/stage3_cli.py` и используются как контракт backend-слоя.
 
-На этапе 2 публичные CRUD-endpoint'ы ещё не открыты.
-Сделан акцент на модель данных и геовалидаторы PostGIS.
+### Синхронизация
+- `sync --source <Copernicus|NASA|Mock> --hours <N> [--field-id <id>]`
+- `sync-status --source <Copernicus|NASA|Mock>`
+
+### Drill-down и диапазоны
+- `query --source <source> --field-id <id> --from <ISO> --to <ISO> --granularity <month|day|hour|point>`
+
+Ответ включает:
+- `summary` по диапазону,
+- `time_bins` следующего уровня (desc),
+- `records` в едином контракте (`value/unit/timestamp/source/quality_flags/meta`).
+
+### Экспорт
+- `export-create --source <source> --field-id <id> --from <ISO> --to <ISO> --granularity <g> --format <json|csv>`
+- `export-process [--dataset-id <id>]`
+- `export-status --dataset-id <id>`
+
+### TTL
+- `ttl-check`
+- `dataset-extend --dataset-id <id> --days <N>`
+- `dataset-view --dataset-id <id> [--granularity <g>]`

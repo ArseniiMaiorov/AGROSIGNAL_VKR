@@ -11,3 +11,5 @@ node_modules/
 dist/
 .~lock*
 backend/.api_port
+backend/exports/*
+!backend/exports/.gitkeep
