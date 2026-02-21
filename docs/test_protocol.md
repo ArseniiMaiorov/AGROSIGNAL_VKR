@@ -38,10 +38,24 @@
 2. Формируется отчёт:
    - `backend/reports/tests/<дата>_stage4_proxy.md`.
 
+## Этап 5
+1. `make test-stage5` — проверяются API-сценарии коммерческого уровня:
+   - единый контракт `/api/v1` (успех/ошибка, `api_version`, `request_id`, русские ошибки);
+   - CRUD домена (enterprise/field/crop/season/operations) и валидации;
+   - RBAC (`admin/manager/agronomist/viewer`) и запрет опасных операций;
+   - weather/satellite endpoints + поведение `NO_DATA` (`200 + status=NO_DATA`);
+   - assistant rules/alerts/recommendations + журнал решений;
+   - export workflow (`POST /export`, `GET /export/{id}`, `GET /export/{id}/download`);
+   - идемпотентность (`Idempotency-Key`) для sync/export;
+   - аудит и метрики (`/api/v1/audit`, `/api/v1/metrics/overview`).
+2. Формируется отчёт:
+   - `backend/reports/tests/<дата>_stage5_api.md`.
+
 ## Сквозной gate
 1. `make quality` — единый прогон:
    - `make test` (покрытие backend/src),
    - `make migrate`,
    - `make test-stage2`,
    - `make test-stage3`,
-   - `make test-stage4`.
+   - `make test-stage4`,
+   - `make test-stage5`.

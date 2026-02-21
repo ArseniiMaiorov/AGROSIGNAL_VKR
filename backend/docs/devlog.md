@@ -93,3 +93,47 @@
 - `make up` + `make print-port` показывают `API_MODE` (`container`/`local`).
 - `curl http://127.0.0.1:<API_PORT>/health` проходит в `local` режиме.
 - `make quality` проходит без ошибок.
+
+## 2026-02-21 — Этап 5: API и пользовательские сценарии (без фронта)
+
+Сделано:
+- Реализован API-контур `/api/v1` с единым форматом ответов/ошибок:
+  - успех: `data + meta`;
+  - ошибка: `error.code`, `error.message`, `error.details`;
+  - обязательные `api_version`, `request_id`.
+- Добавлены endpoint'ы домена:
+  - предприятия/пользователи (`enterprises`, `users`, bind);
+  - поля (`fields`) с soft-delete, restore и history геометрии;
+  - культуры/сезоны (`crops`, `seasons`) с проверкой пересечения активных сезонов;
+  - дневник операций (`fields/{id}/operations`).
+- Добавлены endpoint'ы данных:
+  - погода (`weather`, `weather/summary`);
+  - спутник (`satellite/index`, `satellite/scenes`, `satellite/quality`);
+  - синхронизация (`sync/status`, `sync/run`).
+- Реализован стандарт `NO_DATA`:
+  - `200 OK` + `meta.status=NO_DATA` + пустые массивы.
+- Добавлены endpoint'ы помощника агронома:
+  - правила (`assistant/rules`);
+  - предупреждения/рекомендации (`assistant/alerts`, `assistant/recommendations`);
+  - журнал решений (`assistant/decisions`).
+- Добавлен экспортный API:
+  - `POST /export`, `GET /export/{id}`, `GET /export/{id}/download`, `POST /export/{id}/extend`.
+- Добавлена идемпотентность (`Idempotency-Key`) для `sync/run` и `export`.
+- Добавлены аудит и наблюдаемость:
+  - таблицы `api_audit_log`, `api_request_log`, `api_idempotency_keys`, `api_export_jobs`;
+  - endpoint'ы `GET /api/v1/audit` и `GET /api/v1/metrics/overview`.
+- Планировщик расширен обработкой stage5 export jobs и TTL-предупреждений.
+- Добавлены миграции:
+  - `007_stage5_api_and_user_scenarios.sql`,
+  - `008_stage5_fix_field_trigger_order.sql`,
+  - `009_stage5_fix_bbox_srid_guard.sql`.
+- Добавлен интеграционный тест-набор этапа 5:
+  - `scripts/test_stage5_api.py`,
+  - `make test-stage5`,
+  - отчёт `backend/reports/tests/<дата>_stage5_api.md`.
+
+Проверка:
+- `make test` — PASS, покрытие `backend/src = 100%`.
+- `make test-stage2` / `make test-stage3` / `make test-stage4` — PASS (регрессий нет).
+- `make test-stage5` — PASS (контракт, CRUD, RBAC, assistant, export, audit, metrics).
+- `make quality` — PASS (сквозной green pipeline).

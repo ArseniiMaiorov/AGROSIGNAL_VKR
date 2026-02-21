@@ -1,15 +1,15 @@
-# Архитектура (этапы 1-4)
+# Архитектура (этапы 1-5)
 
 - `backend`: Python API + режимы обработки данных (sync/query/export/TTL/proxy), миграции PostGIS, тестирование.
 - `frontend`: каркас каталогов SPA (заполнение на следующих этапах).
 - `docs`: общая проектная документация и протоколы.
 
 Текущий runtime-стек backend:
-- API: Python HTTP-сервис (`/health`)
+- API: Python HTTP-сервис (`/health`, `/api/v1/...`)
 - Сервисные режимы:
   - `stage3_cli.py` (`sync/query/export/ttl`) и циклический запуск `stage3-cycle`;
   - `stage4_cli.py` (`proxy-set/request/health-check/metrics/degradation`);
-  - `stage_scheduler.py` (фоновый цикл sync/export/ttl по расписанию).
+  - `stage_scheduler.py` (фоновый цикл sync/export/ttl + stage5 export-jobs по расписанию).
 - БД: PostgreSQL + PostGIS
 - Очереди/кэш: Redis
 - Оркестрация: Docker Compose
@@ -72,3 +72,24 @@
 - Деградация:
   - при недоступности источника система сохраняет статус ошибки и последнюю успешную синхронизацию;
   - UI может отображать последнюю успешную дату и причину сбоя без “падения” интерфейса.
+
+## Этап 5 (API и пользовательские сценарии без фронта)
+- Версионирование API:
+  - все бизнес-endpoint'ы доступны в `/api/v1/...`.
+- Единый формат ответов:
+  - успех: `data + meta`;
+  - ошибка: `error.code`, `error.message`, `error.details`;
+  - обязательные `api_version`, `request_id`.
+- RBAC:
+  - роли `admin`, `manager`, `agronomist`, `viewer`;
+  - опасные операции (удаление, экспорт, продление, системные настройки) ограничены по ролям.
+- Аудит:
+  - журнал `api_audit_log`: `user_id`, `action`, `object_type`, `object_id`, `before/after`, `request_id`.
+- Наблюдаемость API:
+  - структурный лог каждого запроса: `request_id`, `user_id`, `endpoint`, `status_code`, `duration_ms`, `error_code`;
+  - агрегирующие метрики: `RPS`, `latency p95`, ошибки по кодам, доля `NO_DATA`.
+- Доменный слой API:
+  - CRUD: `enterprise`, `field` (soft-delete + restore + geometry history), `crop`, `season`, `operations`.
+  - Data endpoints: `weather`, `satellite`, `sync status`.
+  - Assistant endpoints: правила, предупреждения, рекомендации, журнал решений.
+  - Export endpoints: создание, статус, скачивание, продление TTL.

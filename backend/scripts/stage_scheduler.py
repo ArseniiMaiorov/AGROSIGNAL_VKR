@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 
 from stage3_cli import DbClient, Stage3Error, run_cycle
+from stage5_api import process_pending_exports, run_export_ttl_check
 
 
 def _now_utc() -> str:
@@ -50,6 +51,8 @@ def main() -> int:
         started_at = time.perf_counter()
         try:
             report = run_cycle(db, hours=sync_hours, retention_days=retention_days)
+            stage5_exports = process_pending_exports()
+            stage5_ttl = run_export_ttl_check()
             event = {
                 "event": "scheduler_cycle",
                 "timestamp": _now_utc(),
@@ -57,6 +60,8 @@ def main() -> int:
                 "sync_sources": [item.get("source") for item in report.get("sync", [])],
                 "exports_count": int(report.get("exports", {}).get("count", 0)),
                 "ttl_warned_count": int(report.get("ttl", {}).get("warned_count", 0)),
+                "stage5_exports_processed": int(stage5_exports.get("processed_count", 0)),
+                "stage5_ttl_warned_count": int(stage5_ttl.get("warned_count", 0)),
             }
         except Exception as exc:  # noqa: BLE001
             event = {

@@ -33,6 +33,18 @@ class ApiHealthTests(unittest.TestCase):
         parsed_timestamp = datetime.fromisoformat(payload["timestamp"])
         self.assertIsNotNone(parsed_timestamp.tzinfo)
 
+    def test_api_v1_health_endpoint_returns_envelope(self) -> None:
+        port = self.server.server_address[1]
+        url = f"http://127.0.0.1:{port}/api/v1/health"
+        with urlopen(url, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertIn("data", payload)
+        self.assertIn("meta", payload)
+        self.assertEqual(payload["meta"]["api_version"], "v1")
+        self.assertTrue(str(payload["meta"]["request_id"]).startswith("req-"))
+
     def test_unknown_route_returns_not_found(self) -> None:
         port = self.server.server_address[1]
         url = f"http://127.0.0.1:{port}/missing"
@@ -41,7 +53,10 @@ class ApiHealthTests(unittest.TestCase):
 
         self.assertEqual(error.exception.code, 404)
         payload = json.loads(error.exception.read().decode("utf-8"))
-        self.assertEqual(payload, {"error": "Маршрут не найден", "status": 404})
+        self.assertEqual(payload["api_version"], "v1")
+        self.assertIn("request_id", payload)
+        self.assertEqual(payload["error"]["code"], "NOT_FOUND")
+        self.assertEqual(payload["error"]["message"], "Объект не найден")
 
     def test_empty_request_line_is_ignored(self) -> None:
         port = self.server.server_address[1]

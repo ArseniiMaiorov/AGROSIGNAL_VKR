@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: up down lint test migrate test-stage2 test-stage3 test-stage4 quality stage3-sync stage3-cycle ps logs print-port stage4-admin stage4-proxy-get stage4-health stage4-metrics stage4-request-log install-cli
+.PHONY: up down lint test migrate test-stage2 test-stage3 test-stage4 test-stage5 quality stage3-sync stage3-cycle ps logs print-port stage4-admin stage4-proxy-get stage4-health stage4-metrics stage4-request-log install-cli
 
 up:
 	$(MAKE) -C backend up
@@ -25,6 +25,9 @@ test-stage3:
 
 test-stage4:
 	$(MAKE) -C backend test-stage4
+
+test-stage5:
+	$(MAKE) -C backend test-stage5
 
 quality:
 	$(MAKE) -C backend quality

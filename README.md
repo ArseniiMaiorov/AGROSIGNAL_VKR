@@ -2,11 +2,12 @@
 
 Монорепозиторий дипломного проекта.
 
-Текущий статус: завершены этапы 1-4.
+Текущий статус: завершены этапы 1-5.
 - Этап 1: каркас, Docker-окружение, базовый backend, автотесты.
 - Этап 2: модель данных PostGIS, миграции, валидация геометрии полей.
 - Этап 3: единый контракт данных, провайдеры Copernicus/NASA/Mock, sync/drill-down/export/TTL.
 - Этап 4: proxy-контур загрузчиков датасетов, health-check, ретраи, наблюдаемость, режим деградации.
+- Этап 5: полнофункциональный API `/api/v1` (CRUD домена, RBAC, аудит, weather/satellite, assistant, export, idempotency, метрики).
 
 ## Требования
 - Docker + Docker Compose v2
@@ -30,6 +31,7 @@ make migrate
 make test-stage2
 make test-stage3
 make test-stage4
+make test-stage5
 make quality
 ```
 
@@ -78,4 +80,26 @@ make down
 ```bash
 API_PORT=$(cat backend/.api_port)
 curl -sS "http://127.0.0.1:${API_PORT}/health"
+```
+
+## Этап 5: API v1 (без фронта)
+Базовая авторизация для сценариев этапа 5 выполняется по заголовку `X-User-Email`.
+
+Тестовые пользователи, создаваемые seed-механизмом:
+- `admin@zemledar.local`
+- `manager@zemledar.local`
+- `agronomist@zemledar.local`
+- `viewer@zemledar.local`
+
+Быстрые проверки:
+```bash
+API_PORT=$(cat backend/.api_port)
+
+curl -sS -H "X-User-Email: manager@zemledar.local" \
+  "http://127.0.0.1:${API_PORT}/api/v1/auth/me"
+
+curl -sS -H "X-User-Email: manager@zemledar.local" \
+  "http://127.0.0.1:${API_PORT}/api/v1/metrics/overview"
+
+make test-stage5
 ```

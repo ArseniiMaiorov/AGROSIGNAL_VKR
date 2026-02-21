@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.0] - 2026-02-21
+### Добавлено
+- Этап 5: backend API `/api/v1` без фронта для основных пользовательских сценариев.
+- Единый формат ответов/ошибок (`data/meta`, `error.code/message/details`) с `api_version` и `request_id`.
+- Доменные endpoint'ы:
+  - `enterprises`, `users`, `fields` (soft delete/restore/history), `crops`, `seasons`, `field operations`.
+- Endpoint'ы данных:
+  - `weather`, `weather/summary`, `satellite/index`, `satellite/scenes`, `satellite/quality`, `sync/status`, `sync/run`.
+- Endpoint'ы помощника агронома:
+  - `assistant/rules`, `assistant/alerts`, `assistant/recommendations`, `assistant/decisions`.
+- Endpoint'ы экспорта:
+  - `POST /api/v1/export`, `GET /api/v1/export/{id}`, `GET /api/v1/export/{id}/download`, `POST /api/v1/export/{id}/extend`.
+- Идемпотентность для операций `sync/run` и `export` через `Idempotency-Key`.
+- Аудит и наблюдаемость:
+  - таблицы `api_audit_log`, `api_request_log`, `api_idempotency_keys`, `api_export_jobs`;
+  - endpoint `GET /api/v1/metrics/overview`, `GET /api/v1/audit`.
+- Новый тестовый набор `make test-stage5` + протокол `backend/reports/tests/*_stage5_api.md`.
+
+### Изменено
+- API backend переведён с минимального `/health`-обработчика на полноценный HTTP-router stage5.
+- `make quality` расширен проверками этапа 5.
+- Планировщик дополняет цикл обработкой stage5 export jobs и TTL-предупреждений.
+- Docker image API дополнен `postgresql-client` для стабильной работы SQL-слоя API в container-mode.
+- Добавлены миграции:
+  - `007_stage5_api_and_user_scenarios.sql`;
+  - `008_stage5_fix_field_trigger_order.sql`;
+  - `009_stage5_fix_bbox_srid_guard.sql`.
+
 ## [0.4.1] - 2026-02-21
 ### Изменено
 - Этап 3: расширен набор метрик контракта (`NDRE`, `NDMI`, `cloud_mask`) и добавлена миграция `006_stage3_extend_satellite_metrics.sql`.

@@ -1,0 +1,3530 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import re
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from internal.app.config import AppConfig
+from internal.app.health import build_health_payload
+from stage3_cli import (
+    CONTRACT_VERSION,
+    DbClient,
+    Stage3Error,
+    _iso_utc,
+    _parse_ts,
+    _sql_quote,
+    create_export_task,
+    extend_dataset_ttl,
+    get_export_status,
+    get_sync_status,
+    process_exports,
+    query_range,
+    run_sync,
+)
+from stage4_proxy import get_degradation_status
+
+EXPORTS_DIR = ROOT / "exports"
+API_VERSION = "v1"
+WEATHER_METRICS = {"precipitation", "temperature", "wind_speed", "cloudiness"}
+SATELLITE_METRICS = {"ndvi", "ndre", "ndmi"}
+SATELLITE_QUALITY_METRICS = {"cloudiness", "cloud_mask"}
+ROLE_ADMIN = "admin"
+ROLE_MANAGER = "manager"
+ROLE_AGRONOMIST = "agronomist"
+ROLE_VIEWER = "viewer"
+ROLE_ALIASES = {
+    "admin": "admin",
+    "manager": "manager",
+    "agronomist": "agronomist",
+    "agronom": "agronomist",
+    "viewer": "viewer",
+}
+SOURCE_ALIASES = {
+    "copernicus": "Copernicus",
+    "nasa": "NASA",
+    "mock": "Mock",
+}
+
+
+class ApiError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status: int, details: Any | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.details = details
+
+
+@dataclass
+class UserContext:
+    user_id: int
+    enterprise_id: int | None
+    role_code: str
+    email: str
+    full_name: str
+
+
+@dataclass
+class ApiHttpResponse:
+    status_code: int
+    body: bytes
+    content_type: str = "application/json; charset=utf-8"
+    headers: dict[str, str] = field(default_factory=dict)
+    error_code: str | None = None
+    user_id: int | None = None
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class Stage5ApiApp:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self._seed_lock = threading.Lock()
+        self._seed_done = False
+
+    # -------------------------------
+    # Public request handling
+    # -------------------------------
+    def handle_request(
+        self,
+        *,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        headers: dict[str, str],
+        raw_body: bytes,
+        request_id: str,
+    ) -> ApiHttpResponse:
+        if method == "GET" and path == "/health":
+            payload = build_health_payload(self.config)
+            return ApiHttpResponse(status_code=200, body=self._json_bytes(payload))
+
+        if path == "/api/v1/health" and method == "GET":
+            payload = build_health_payload(self.config)
+            return self._success(payload, request_id=request_id)
+
+        if not path.startswith("/api/v1/"):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+
+        db = DbClient()
+        try:
+            db.ensure_ready()
+            self._ensure_stage5_seed(db)
+        except Stage3Error as exc:
+            raise ApiError(
+                "SOURCE_UNAVAILABLE",
+                "Источник данных недоступен: не удалось подключиться к БД",
+                status=503,
+                details=str(exc),
+            ) from exc
+
+        user = self._resolve_user(db, headers)
+
+        # Auth and utility routes
+        if path == "/api/v1/auth/me" and method == "GET":
+            return self._success(
+                {
+                    "user_id": user.user_id,
+                    "email": user.email,
+                    "full_name": user.full_name,
+                    "role": user.role_code,
+                    "enterprise_id": user.enterprise_id,
+                },
+                request_id=request_id,
+                user_id=user.user_id,
+            )
+
+        if path == "/api/v1/metrics/overview" and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            data = self._build_metrics_overview(db)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        if path == "/api/v1/audit" and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            data = self._list_audit_log(db, query)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        # Enterprises
+        if path == "/api/v1/enterprises":
+            if method == "GET":
+                data = self._list_enterprises(db, user, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_enterprise(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        enterprise_id = self._match_id(path, r"^/api/v1/enterprises/(\d+)$")
+        if enterprise_id is not None:
+            if method == "GET":
+                data = self._get_enterprise(db, user, enterprise_id)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "PUT":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                payload = self._parse_json_body(raw_body)
+                updated = self._update_enterprise(db, user, enterprise_id, payload, request_id)
+                return self._success(updated, request_id=request_id, user_id=user.user_id)
+
+        bind_enterprise_id = self._match_id(path, r"^/api/v1/enterprises/(\d+)/users/bind$")
+        if bind_enterprise_id is not None and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            payload = self._parse_json_body(raw_body)
+            bound = self._bind_user_to_enterprise(db, user, bind_enterprise_id, payload, request_id)
+            return self._success(bound, request_id=request_id, user_id=user.user_id)
+
+        # Users
+        if path == "/api/v1/users":
+            if method == "GET":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                data = self._list_users(db, user, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_user(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        # Fields
+        if path == "/api/v1/fields":
+            if method == "GET":
+                data = self._list_fields(db, user, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_field(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        field_id = self._match_id(path, r"^/api/v1/fields/(\d+)$")
+        if field_id is not None:
+            if method == "GET":
+                data = self._get_field(db, user, field_id)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "PUT":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                updated = self._update_field(db, user, field_id, payload, request_id)
+                return self._success(updated, request_id=request_id, user_id=user.user_id)
+            if method == "DELETE":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                deleted = self._soft_delete_field(db, user, field_id, request_id)
+                return self._success(deleted, request_id=request_id, user_id=user.user_id)
+
+        field_restore_id = self._match_id(path, r"^/api/v1/fields/(\d+)/restore$")
+        if field_restore_id is not None and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            restored = self._restore_field(db, user, field_restore_id, request_id)
+            return self._success(restored, request_id=request_id, user_id=user.user_id)
+
+        field_history_id = self._match_id(path, r"^/api/v1/fields/(\d+)/history$")
+        if field_history_id is not None and method == "GET":
+            data = self._field_history(db, user, field_history_id, query)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        field_operations_id = self._match_id(path, r"^/api/v1/fields/(\d+)/operations$")
+        if field_operations_id is not None:
+            if method == "GET":
+                data = self._list_field_operations(db, user, field_operations_id, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_field_operation(db, user, field_operations_id, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        # Crops
+        if path == "/api/v1/crops":
+            if method == "GET":
+                data = self._list_crops(db, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_crop(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        crop_id = self._match_id(path, r"^/api/v1/crops/(\d+)$")
+        if crop_id is not None:
+            if method == "GET":
+                data = self._get_crop(db, crop_id)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "PUT":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+                payload = self._parse_json_body(raw_body)
+                updated = self._update_crop(db, user, crop_id, payload, request_id)
+                return self._success(updated, request_id=request_id, user_id=user.user_id)
+
+        # Seasons
+        if path == "/api/v1/seasons":
+            if method == "GET":
+                data = self._list_seasons(db, user, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_season(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        season_id = self._match_id(path, r"^/api/v1/seasons/(\d+)$")
+        if season_id is not None:
+            if method == "GET":
+                data = self._get_season(db, user, season_id)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "PUT":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                updated = self._update_season(db, user, season_id, payload, request_id)
+                return self._success(updated, request_id=request_id, user_id=user.user_id)
+
+        # Data endpoints: weather/satellite/sync
+        weather_field_id = self._match_id(path, r"^/api/v1/fields/(\d+)/weather$")
+        if weather_field_id is not None and method == "GET":
+            data, no_data = self._get_weather_series(db, user, weather_field_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        weather_summary_field_id = self._match_id(path, r"^/api/v1/fields/(\d+)/weather/summary$")
+        if weather_summary_field_id is not None and method == "GET":
+            data, no_data = self._get_weather_summary(db, user, weather_summary_field_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        sat_index_field_id = self._match_id(path, r"^/api/v1/fields/(\d+)/satellite/index$")
+        if sat_index_field_id is not None and method == "GET":
+            data, no_data = self._get_satellite_index(db, user, sat_index_field_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        sat_scenes_field_id = self._match_id(path, r"^/api/v1/fields/(\d+)/satellite/scenes$")
+        if sat_scenes_field_id is not None and method == "GET":
+            data, no_data = self._get_satellite_scenes(db, user, sat_scenes_field_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        sat_quality_field_id = self._match_id(path, r"^/api/v1/fields/(\d+)/satellite/quality$")
+        if sat_quality_field_id is not None and method == "GET":
+            data, no_data = self._get_satellite_quality(db, user, sat_quality_field_id, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
+        if path == "/api/v1/sync/status" and method == "GET":
+            source = self._normalize_source(self._query_str(query, "source", required=True))
+            data = get_sync_status(db, source)
+            degradation = get_degradation_status(db, source)
+            data["degradation_mode"] = degradation.get("degradation_mode")
+            data["degradation_message"] = degradation.get("message")
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        if path == "/api/v1/sync/run" and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            payload = self._parse_json_body(raw_body)
+            idempotency_key = self._header(headers, "idempotency-key")
+            response = self._sync_run(db, user, payload, request_id, idempotency_key)
+            return response
+
+        # Assistant
+        if path == "/api/v1/assistant/rules":
+            if method == "GET":
+                data = self._list_assistant_rules(db, user, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_assistant_rule(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        assistant_rule_id = self._match_id(path, r"^/api/v1/assistant/rules/(\d+)$")
+        if assistant_rule_id is not None:
+            if method == "PUT":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                updated = self._update_assistant_rule(db, user, assistant_rule_id, payload, request_id)
+                return self._success(updated, request_id=request_id, user_id=user.user_id)
+            if method == "DELETE":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                archived = self._archive_assistant_rule(db, user, assistant_rule_id, request_id)
+                return self._success(archived, request_id=request_id, user_id=user.user_id)
+
+        field_alerts_id = self._match_id(path, r"^/api/v1/fields/(\d+)/assistant/alerts$")
+        if field_alerts_id is not None and method == "GET":
+            data = self._get_assistant_alerts(db, user, field_alerts_id, query)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        field_recommendations_id = self._match_id(path, r"^/api/v1/fields/(\d+)/assistant/recommendations$")
+        if field_recommendations_id is not None and method == "GET":
+            data = self._get_assistant_recommendations(db, user, field_recommendations_id, query)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        if path == "/api/v1/assistant/decisions":
+            if method == "GET":
+                data = self._list_assistant_decisions(db, user, query)
+                return self._success(data, request_id=request_id, user_id=user.user_id)
+            if method == "POST":
+                self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST})
+                payload = self._parse_json_body(raw_body)
+                created = self._create_assistant_decision(db, user, payload, request_id)
+                return self._success(created, request_id=request_id, status=201, user_id=user.user_id)
+
+        # Export
+        if path == "/api/v1/export" and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            payload = self._parse_json_body(raw_body)
+            idempotency_key = self._header(headers, "idempotency-key")
+            response = self._create_export_job(db, user, payload, request_id, idempotency_key)
+            return response
+
+        export_id = self._match_text(path, r"^/api/v1/export/([a-zA-Z0-9_-]+)$")
+        if export_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_export_job(db, user, export_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        export_extend_id = self._match_text(path, r"^/api/v1/export/([a-zA-Z0-9_-]+)/extend$")
+        if export_extend_id is not None and method == "POST":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER})
+            payload = self._parse_json_body(raw_body)
+            days = self._int_value(payload.get("days"), "days", min_value=1, max_value=365)
+            data = self._extend_export_job(db, user, export_extend_id, days, request_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        export_download_id = self._match_text(path, r"^/api/v1/export/([a-zA-Z0-9_-]+)/download$")
+        if export_download_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            return self._download_export_job(db, user, export_download_id, request_id)
+
+        raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+
+    # -------------------------------
+    # Observability
+    # -------------------------------
+    def record_request(
+        self,
+        *,
+        request_id: str,
+        user_id: int | None,
+        method: str,
+        endpoint: str,
+        status_code: int,
+        duration_ms: int,
+        error_code: str | None,
+    ) -> None:
+        event = {
+            "request_id": request_id,
+            "user_id": user_id,
+            "endpoint": endpoint,
+            "status_code": status_code,
+            "duration_ms": duration_ms,
+            "error_code": error_code,
+            "timestamp": _iso_utc(datetime.now(timezone.utc)),
+        }
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+
+        try:
+            db = DbClient()
+            db.ensure_ready()
+            db.exec_checked(
+                f"""
+                INSERT INTO api_request_log (
+                    request_id,
+                    user_id,
+                    endpoint,
+                    method,
+                    status_code,
+                    duration_ms,
+                    error_code
+                ) VALUES (
+                    {_sql_quote(request_id)},
+                    {str(user_id) if user_id is not None else 'NULL'},
+                    {_sql_quote(endpoint[:500])},
+                    {_sql_quote(method)},
+                    {int(status_code)},
+                    {int(max(duration_ms, 0))},
+                    {(_sql_quote(error_code) if error_code else 'NULL')}
+                );
+                """
+            )
+        except Exception:
+            return
+
+    # -------------------------------
+    # Seed / auth / RBAC
+    # -------------------------------
+    def _ensure_stage5_seed(self, db: DbClient) -> None:
+        if self._seed_done:
+            return
+
+        with self._seed_lock:
+            if self._seed_done:
+                return
+
+            db.exec_checked(
+                """
+                INSERT INTO roles (code, name)
+                VALUES
+                    ('admin', 'Администратор'),
+                    ('manager', 'Менеджер'),
+                    ('agronomist', 'Агроном'),
+                    ('viewer', 'Наблюдатель')
+                ON CONFLICT (code) DO NOTHING;
+
+                INSERT INTO enterprises (name)
+                SELECT 'ООО Демонстрационное хозяйство API v1'
+                WHERE NOT EXISTS (SELECT 1 FROM enterprises);
+                """
+            )
+
+            db.exec_checked(
+                """
+                INSERT INTO app_users (enterprise_id, role_id, email, full_name, password_hash, is_active)
+                SELECT
+                    (SELECT id FROM enterprises ORDER BY id LIMIT 1),
+                    (SELECT id FROM roles WHERE code = 'admin'),
+                    'admin@zemledar.local',
+                    'Администратор API',
+                    'hash',
+                    TRUE
+                WHERE NOT EXISTS (SELECT 1 FROM app_users WHERE email = 'admin@zemledar.local');
+
+                INSERT INTO app_users (enterprise_id, role_id, email, full_name, password_hash, is_active)
+                SELECT
+                    (SELECT id FROM enterprises ORDER BY id LIMIT 1),
+                    (SELECT id FROM roles WHERE code = 'manager'),
+                    'manager@zemledar.local',
+                    'Менеджер API',
+                    'hash',
+                    TRUE
+                WHERE NOT EXISTS (SELECT 1 FROM app_users WHERE email = 'manager@zemledar.local');
+
+                INSERT INTO app_users (enterprise_id, role_id, email, full_name, password_hash, is_active)
+                SELECT
+                    (SELECT id FROM enterprises ORDER BY id LIMIT 1),
+                    (SELECT id FROM roles WHERE code = 'agronomist'),
+                    'agronomist@zemledar.local',
+                    'Агроном API',
+                    'hash',
+                    TRUE
+                WHERE NOT EXISTS (SELECT 1 FROM app_users WHERE email = 'agronomist@zemledar.local');
+
+                INSERT INTO app_users (enterprise_id, role_id, email, full_name, password_hash, is_active)
+                SELECT
+                    (SELECT id FROM enterprises ORDER BY id LIMIT 1),
+                    (SELECT id FROM roles WHERE code = 'viewer'),
+                    'viewer@zemledar.local',
+                    'Наблюдатель API',
+                    'hash',
+                    TRUE
+                WHERE NOT EXISTS (SELECT 1 FROM app_users WHERE email = 'viewer@zemledar.local');
+                """
+            )
+
+            db.exec_checked(
+                """
+                UPDATE enterprises e
+                SET owner_user_id = (
+                    SELECT id FROM app_users WHERE email = 'admin@zemledar.local' LIMIT 1
+                )
+                WHERE e.owner_user_id IS NULL;
+
+                INSERT INTO crops (name)
+                VALUES ('Пшеница')
+                ON CONFLICT (name) DO NOTHING;
+                """
+            )
+
+            self._seed_done = True
+
+    def _resolve_user(self, db: DbClient, headers: dict[str, str]) -> UserContext:
+        email = self._header(headers, "x-user-email") or "viewer@zemledar.local"
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(u)
+            FROM (
+                SELECT
+                    au.id AS user_id,
+                    au.enterprise_id,
+                    r.code AS role_code,
+                    au.email,
+                    au.full_name
+                FROM app_users au
+                JOIN roles r ON r.id = au.role_id
+                WHERE au.email = {_sql_quote(email)}
+                  AND au.is_active = TRUE
+                ORDER BY au.id
+                LIMIT 1
+            ) u;
+            """
+        )
+
+        if not isinstance(payload, dict):
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403, details="Пользователь не найден")
+
+        role_code = str(payload.get("role_code") or "")
+        normalized_role = ROLE_ALIASES.get(role_code)
+        if normalized_role is None:
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403, details="Неизвестная роль")
+
+        return UserContext(
+            user_id=int(payload["user_id"]),
+            enterprise_id=(int(payload["enterprise_id"]) if payload.get("enterprise_id") is not None else None),
+            role_code=normalized_role,
+            email=str(payload["email"]),
+            full_name=str(payload["full_name"]),
+        )
+
+    def _require_roles(self, user: UserContext, allowed: set[str]) -> None:
+        if user.role_code not in allowed:
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403)
+
+    # -------------------------------
+    # Enterprise + users
+    # -------------------------------
+    def _list_enterprises(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        filter_name = self._query_str(query, "filter", required=False)
+
+        where_parts = ["1=1"]
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"e.id = {user.enterprise_id}")
+        if filter_name:
+            where_parts.append(f"e.name ILIKE {_sql_quote('%' + filter_name + '%')}")
+
+        where_sql = " AND ".join(where_parts)
+        sort_sql = self._sort_clause(self._query_str(query, "sort", required=False), {"id", "name", "created_at"}, "id")
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    e.id,
+                    e.name,
+                    e.owner_user_id,
+                    to_char(e.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM enterprises e
+                WHERE {where_sql}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _create_enterprise(self, db: DbClient, user: UserContext, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        name = self._str_value(payload.get("name"), "name", min_len=2, max_len=250)
+
+        exists = db.exec_checked(
+            f"""
+            SELECT COUNT(*)
+            FROM enterprises
+            WHERE lower(name) = lower({_sql_quote(name)})
+              AND COALESCE(owner_user_id, 0) = {user.user_id};
+            """,
+            tuples_only=True,
+        )
+        if self._scalar_int(exists) > 0:
+            raise ApiError(
+                "CONFLICT",
+                "Конфликт состояния (повторная операция)",
+                status=409,
+                details="Предприятие с таким названием уже существует для владельца",
+            )
+
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO enterprises (name, owner_user_id)
+                VALUES ({_sql_quote(name)}, {user.user_id})
+                RETURNING id, name, owner_user_id, created_at
+            )
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    id,
+                    name,
+                    owner_user_id,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM ins
+            ) x;
+            """
+        )
+        assert isinstance(created, dict)
+        self._write_audit(db, user.user_id, "enterprise.create", "enterprise", str(created["id"]), None, created, request_id)
+        return created
+
+    def _get_enterprise(self, db: DbClient, user: UserContext, enterprise_id: int) -> dict[str, Any]:
+        if user.role_code != ROLE_ADMIN and user.enterprise_id != enterprise_id:
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403)
+
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(e)
+            FROM (
+                SELECT
+                    id,
+                    name,
+                    owner_user_id,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM enterprises
+                WHERE id = {enterprise_id}
+            ) e;
+            """
+        )
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+        return payload
+
+    def _update_enterprise(
+        self,
+        db: DbClient,
+        user: UserContext,
+        enterprise_id: int,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._get_enterprise(db, user, enterprise_id)
+        name = self._str_value(payload.get("name"), "name", min_len=2, max_len=250)
+
+        db.exec_checked(
+            f"""
+            UPDATE enterprises
+            SET name = {_sql_quote(name)}
+            WHERE id = {enterprise_id};
+            """
+        )
+        after = self._get_enterprise(db, user, enterprise_id)
+        self._write_audit(db, user.user_id, "enterprise.update", "enterprise", str(enterprise_id), before, after, request_id)
+        return after
+
+    def _bind_user_to_enterprise(
+        self,
+        db: DbClient,
+        user: UserContext,
+        enterprise_id: int,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        user_email = self._str_value(payload.get("user_email"), "user_email", min_len=5, max_len=250)
+        before = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT id, enterprise_id, email FROM app_users WHERE email = {_sql_quote(user_email)}
+            ) x;
+            """
+        )
+        if not isinstance(before, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404, details="Пользователь не найден")
+
+        db.exec_checked(
+            f"""
+            UPDATE app_users
+            SET enterprise_id = {enterprise_id}
+            WHERE email = {_sql_quote(user_email)};
+            """
+        )
+
+        after = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT id, enterprise_id, email FROM app_users WHERE email = {_sql_quote(user_email)}
+            ) x;
+            """
+        )
+        assert isinstance(after, dict)
+        self._write_audit(
+            db,
+            user.user_id,
+            "enterprise.bind_user",
+            "user",
+            str(after.get("id")),
+            before,
+            after,
+            request_id,
+        )
+        return after
+
+    def _list_users(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        where_parts = ["u.is_active = TRUE"]
+
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"u.enterprise_id = {user.enterprise_id}")
+
+        role_filter = self._query_str(query, "role", required=False)
+        if role_filter:
+            normalized_role = ROLE_ALIASES.get(role_filter.lower())
+            if not normalized_role:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: неизвестная роль", status=422)
+            where_parts.append(f"r.code = {_sql_quote(normalized_role)}")
+
+        where_sql = " AND ".join(where_parts)
+        sort_sql = self._sort_clause(self._query_str(query, "sort", required=False), {"id", "email", "created_at"}, "id")
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    u.id,
+                    u.enterprise_id,
+                    r.code AS role,
+                    u.email,
+                    u.full_name,
+                    to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM app_users u
+                JOIN roles r ON r.id = u.role_id
+                WHERE {where_sql}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _create_user(
+        self,
+        db: DbClient,
+        actor: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        email = self._str_value(payload.get("email"), "email", min_len=5, max_len=250)
+        full_name = self._str_value(payload.get("full_name"), "full_name", min_len=2, max_len=250)
+        role_raw = self._str_value(payload.get("role"), "role", min_len=3, max_len=30)
+        role_code = ROLE_ALIASES.get(role_raw.lower())
+        if role_code is None:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: неизвестная роль", status=422)
+
+        enterprise_id = self._int_value(payload.get("enterprise_id"), "enterprise_id", min_value=1)
+        if actor.role_code != ROLE_ADMIN and actor.enterprise_id != enterprise_id:
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403)
+
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO app_users (enterprise_id, role_id, email, full_name, password_hash, is_active)
+                VALUES (
+                    {enterprise_id},
+                    (SELECT id FROM roles WHERE code = {_sql_quote(role_code)} LIMIT 1),
+                    {_sql_quote(email)},
+                    {_sql_quote(full_name)},
+                    'hash',
+                    TRUE
+                )
+                RETURNING id, enterprise_id, role_id, email, full_name, created_at
+            )
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    i.id,
+                    i.enterprise_id,
+                    r.code AS role,
+                    i.email,
+                    i.full_name,
+                    to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM ins i
+                JOIN roles r ON r.id = i.role_id
+            ) x;
+            """
+        )
+
+        if not isinstance(created, dict):
+            raise ApiError("CONFLICT", "Конфликт состояния (повторная операция)", status=409)
+
+        self._write_audit(db, actor.user_id, "user.create", "user", str(created["id"]), None, created, request_id)
+        return created
+
+    # -------------------------------
+    # Fields + history + operations
+    # -------------------------------
+    def _list_fields(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        include_deleted = self._query_bool(query, "with_deleted", default=False)
+
+        where_parts = ["1=1"]
+        if not include_deleted:
+            where_parts.append("f.deleted_at IS NULL")
+
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"f.enterprise_id = {user.enterprise_id}")
+
+        enterprise_filter = self._query_int(query, "enterprise_id")
+        if enterprise_filter is not None:
+            if user.role_code != ROLE_ADMIN and user.enterprise_id != enterprise_filter:
+                raise ApiError("FORBIDDEN", "Недостаточно прав", status=403)
+            where_parts.append(f"f.enterprise_id = {enterprise_filter}")
+
+        filter_text = self._query_str(query, "filter", required=False)
+        if filter_text:
+            where_parts.append(f"f.name ILIKE {_sql_quote('%' + filter_text + '%')}")
+
+        where_sql = " AND ".join(where_parts)
+        sort_sql = self._sort_clause(
+            self._query_str(query, "sort", required=False),
+            {"id", "name", "created_at", "updated_at", "area_ha"},
+            "id",
+        )
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    f.id,
+                    f.enterprise_id,
+                    f.season_id,
+                    f.name,
+                    ROUND(f.area_ha::numeric, 4) AS area_ha,
+                    ST_AsGeoJSON(f.geom)::json AS geometry,
+                    ST_AsGeoJSON(f.bbox)::json AS bbox,
+                    to_char(f.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                    to_char(f.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+                    CASE
+                        WHEN f.deleted_at IS NULL THEN NULL
+                        ELSE to_char(f.deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    END AS deleted_at
+                FROM fields f
+                WHERE {where_sql}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _get_field(self, db: DbClient, user: UserContext, field_id: int, *, include_deleted: bool = True) -> dict[str, Any]:
+        where_parts = [f"f.id = {field_id}"]
+        if not include_deleted:
+            where_parts.append("f.deleted_at IS NULL")
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"f.enterprise_id = {user.enterprise_id}")
+
+        where_sql = " AND ".join(where_parts)
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(fx)
+            FROM (
+                SELECT
+                    f.id,
+                    f.enterprise_id,
+                    f.season_id,
+                    f.name,
+                    ROUND(f.area_ha::numeric, 4) AS area_ha,
+                    ST_AsGeoJSON(f.geom)::json AS geometry,
+                    ST_AsGeoJSON(f.bbox)::json AS bbox,
+                    to_char(f.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                    to_char(f.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+                    CASE
+                        WHEN f.deleted_at IS NULL THEN NULL
+                        ELSE to_char(f.deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    END AS deleted_at
+                FROM fields f
+                WHERE {where_sql}
+            ) fx;
+            """
+        )
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+        return payload
+
+    def _create_field(
+        self,
+        db: DbClient,
+        user: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        enterprise_id = self._int_value(payload.get("enterprise_id"), "enterprise_id", min_value=1)
+        if user.role_code != ROLE_ADMIN and user.enterprise_id != enterprise_id:
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403)
+
+        name = self._str_value(payload.get("name"), "name", min_len=2, max_len=250)
+        geom_sql = self._geometry_sql(payload)
+
+        try:
+            created_id_raw = db.exec_checked(
+                f"""
+                INSERT INTO fields (enterprise_id, season_id, name, geom)
+                VALUES ({enterprise_id}, NULL, {_sql_quote(name)}, {geom_sql})
+                RETURNING id;
+                """,
+                tuples_only=True,
+            )
+        except Stage3Error as exc:
+            raise self._map_geometry_error(exc)
+
+        field_id = self._scalar_int(created_id_raw)
+        after = self._get_field(db, user, field_id)
+        self._write_audit(db, user.user_id, "field.create", "field", str(field_id), None, after, request_id)
+        return after
+
+    def _update_field(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._get_field(db, user, field_id)
+
+        name = payload.get("name")
+        geom_update = payload.get("geojson") is not None or payload.get("wkt") is not None or payload.get("geometry") is not None
+        set_parts: list[str] = []
+
+        if name is not None:
+            set_parts.append(f"name = {_sql_quote(self._str_value(name, 'name', min_len=2, max_len=250))}")
+
+        if geom_update:
+            geom_sql = self._geometry_sql(payload)
+            set_parts.append(f"geom = {geom_sql}")
+
+        if not set_parts:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: нечего обновлять", status=422)
+
+        try:
+            db.exec_checked(
+                f"""
+                UPDATE fields
+                SET {', '.join(set_parts)}
+                WHERE id = {field_id};
+                """
+            )
+        except Stage3Error as exc:
+            raise self._map_geometry_error(exc)
+
+        after = self._get_field(db, user, field_id)
+
+        if geom_update:
+            old_geom_json = json.dumps(before.get("geometry"), ensure_ascii=False)
+            new_geom_json = json.dumps(after.get("geometry"), ensure_ascii=False)
+            db.exec_checked(
+                f"""
+                INSERT INTO field_geometry_history (field_id, changed_by, request_id, old_geom, new_geom)
+                VALUES (
+                    {field_id},
+                    {user.user_id},
+                    {_sql_quote(request_id)},
+                    ST_SetSRID(ST_GeomFromGeoJSON($${old_geom_json}$$), 4326),
+                    ST_SetSRID(ST_GeomFromGeoJSON($${new_geom_json}$$), 4326)
+                );
+                """
+            )
+
+        self._write_audit(db, user.user_id, "field.update", "field", str(field_id), before, after, request_id)
+        return after
+
+    def _soft_delete_field(self, db: DbClient, user: UserContext, field_id: int, request_id: str) -> dict[str, Any]:
+        before = self._get_field(db, user, field_id)
+        db.exec_checked(
+            f"""
+            UPDATE fields
+            SET deleted_at = NOW()
+            WHERE id = {field_id};
+            """
+        )
+        after = self._get_field(db, user, field_id)
+        self._write_audit(db, user.user_id, "field.soft_delete", "field", str(field_id), before, after, request_id)
+        return after
+
+    def _restore_field(self, db: DbClient, user: UserContext, field_id: int, request_id: str) -> dict[str, Any]:
+        before = self._get_field(db, user, field_id)
+        db.exec_checked(
+            f"""
+            UPDATE fields
+            SET deleted_at = NULL
+            WHERE id = {field_id};
+            """
+        )
+        after = self._get_field(db, user, field_id)
+        self._write_audit(db, user.user_id, "field.restore", "field", str(field_id), before, after, request_id)
+        return after
+
+    def _field_history(self, db: DbClient, user: UserContext, field_id: int, query: dict[str, list[str]]) -> dict[str, Any]:
+        _ = self._get_field(db, user, field_id)
+        page, page_size, offset = self._pagination(query)
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    h.id,
+                    h.field_id,
+                    h.changed_by,
+                    h.request_id,
+                    ST_AsGeoJSON(h.old_geom)::json AS old_geometry,
+                    ST_AsGeoJSON(h.new_geom)::json AS new_geometry,
+                    to_char(h.changed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS changed_at
+                FROM field_geometry_history h
+                WHERE h.field_id = {field_id}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY changed_at DESC
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _create_field_operation(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        operation_type = self._str_value(payload.get("operation_type"), "operation_type", min_len=3, max_len=30)
+        operation_at = self._iso_required(payload.get("operation_at"), "operation_at")
+        comment = payload.get("comment")
+        comment_sql = _sql_quote(self._str_value(comment, "comment", min_len=0, max_len=2000)) if comment else "NULL"
+
+        point_sql = self._optional_point_sql(payload)
+        zone_sql = self._optional_zone_sql(payload)
+
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO field_operations (
+                    field_id,
+                    user_id,
+                    operation_type,
+                    operation_at,
+                    comment,
+                    point_geom,
+                    zone_geom
+                ) VALUES (
+                    {field_id},
+                    {user.user_id},
+                    {_sql_quote(operation_type)},
+                    {_sql_quote(operation_at)}::timestamptz,
+                    {comment_sql},
+                    {point_sql},
+                    {zone_sql}
+                )
+                RETURNING id, field_id, user_id, operation_type, operation_at, comment, point_geom, zone_geom, created_at
+            )
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    id,
+                    field_id,
+                    user_id,
+                    operation_type,
+                    to_char(operation_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS operation_at,
+                    comment,
+                    ST_AsGeoJSON(point_geom)::json AS point_geometry,
+                    ST_AsGeoJSON(zone_geom)::json AS zone_geometry,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM ins
+            ) x;
+            """
+        )
+        assert isinstance(created, dict)
+
+        self._write_audit(db, user.user_id, "operation.create", "field_operation", str(created["id"]), None, created, request_id)
+        return created
+
+    def _list_field_operations(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        page, page_size, offset = self._pagination(query)
+        sort_sql = self._sort_clause(
+            self._query_str(query, "sort", required=False),
+            {"id", "operation_at", "created_at"},
+            "operation_at",
+        )
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    fo.id,
+                    fo.field_id,
+                    fo.user_id,
+                    fo.operation_type,
+                    to_char(fo.operation_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS operation_at,
+                    fo.comment,
+                    ST_AsGeoJSON(fo.point_geom)::json AS point_geometry,
+                    ST_AsGeoJSON(fo.zone_geom)::json AS zone_geometry,
+                    to_char(fo.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM field_operations fo
+                WHERE fo.field_id = {field_id}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    # -------------------------------
+    # Crops + seasons
+    # -------------------------------
+    def _list_crops(self, db: DbClient, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        filter_text = self._query_str(query, "filter", required=False)
+        where_sql = "1=1"
+        if filter_text:
+            where_sql = f"name ILIKE {_sql_quote('%' + filter_text + '%')}"
+
+        sort_sql = self._sort_clause(self._query_str(query, "sort", required=False), {"id", "name", "created_at"}, "id")
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    id,
+                    name,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM crops
+                WHERE {where_sql}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _create_crop(self, db: DbClient, user: UserContext, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        name = self._str_value(payload.get("name"), "name", min_len=2, max_len=250)
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO crops (name)
+                VALUES ({_sql_quote(name)})
+                RETURNING id, name, created_at
+            )
+            SELECT row_to_json(x)
+            FROM (
+                SELECT id, name, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM ins
+            ) x;
+            """
+        )
+        if not isinstance(created, dict):
+            raise ApiError("CONFLICT", "Конфликт состояния (повторная операция)", status=409)
+
+        self._write_audit(db, user.user_id, "crop.create", "crop", str(created["id"]), None, created, request_id)
+        return created
+
+    def _get_crop(self, db: DbClient, crop_id: int) -> dict[str, Any]:
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    id,
+                    name,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM crops
+                WHERE id = {crop_id}
+            ) x;
+            """
+        )
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+        return payload
+
+    def _update_crop(self, db: DbClient, user: UserContext, crop_id: int, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        before = self._get_crop(db, crop_id)
+        name = self._str_value(payload.get("name"), "name", min_len=2, max_len=250)
+        db.exec_checked(
+            f"""
+            UPDATE crops
+            SET name = {_sql_quote(name)}
+            WHERE id = {crop_id};
+            """
+        )
+        after = self._get_crop(db, crop_id)
+        self._write_audit(db, user.user_id, "crop.update", "crop", str(crop_id), before, after, request_id)
+        return after
+
+    def _list_seasons(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        where_parts = ["1=1"]
+
+        field_id = self._query_int(query, "field_id")
+        if field_id is not None:
+            where_parts.append(f"s.field_id = {field_id}")
+
+        status_filter = self._query_str(query, "status", required=False)
+        if status_filter:
+            if status_filter not in {"active", "archived"}:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: status", status=422)
+            where_parts.append(f"s.status = {_sql_quote(status_filter)}")
+
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"s.enterprise_id = {user.enterprise_id}")
+
+        where_sql = " AND ".join(where_parts)
+        sort_sql = self._sort_clause(
+            self._query_str(query, "sort", required=False),
+            {"id", "started_at", "ended_at", "created_at"},
+            "started_at",
+        )
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    s.id,
+                    s.enterprise_id,
+                    s.field_id,
+                    s.crop_id,
+                    c.name AS crop_name,
+                    s.year,
+                    s.name,
+                    s.status,
+                    s.started_at,
+                    s.ended_at,
+                    s.close_reason,
+                    to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM seasons s
+                JOIN crops c ON c.id = s.crop_id
+                WHERE {where_sql}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _create_season(self, db: DbClient, user: UserContext, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        field_id = self._int_value(payload.get("field_id"), "field_id", min_value=1)
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        enterprise_id = int(field["enterprise_id"])
+        self._assert_enterprise_scope(user, enterprise_id)
+
+        crop_id = self._int_value(payload.get("crop_id"), "crop_id", min_value=1)
+        name = self._str_value(payload.get("name"), "name", min_len=2, max_len=250)
+        year = self._int_value(payload.get("year"), "year", min_value=2000, max_value=2100)
+        started_at = self._date_value(payload.get("started_at"), "started_at")
+        ended_at = self._date_optional(payload.get("ended_at"), "ended_at")
+        status = self._str_value(payload.get("status", "active"), "status", min_len=6, max_len=10)
+        if status not in {"active", "archived"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: status", status=422)
+
+        close_reason = payload.get("close_reason")
+        close_reason_sql = _sql_quote(self._str_value(close_reason, "close_reason", min_len=2, max_len=1000)) if close_reason else "NULL"
+
+        if status == "archived" and close_reason_sql == "NULL":
+            raise ApiError(
+                "VALIDATION_ERROR",
+                "Некорректные входные данные: сезон нельзя закрыть без обязательных данных",
+                status=422,
+            )
+
+        self._ensure_no_active_season_overlap(db, field_id, started_at, ended_at, exclude_id=None, status=status)
+
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO seasons (
+                    enterprise_id,
+                    field_id,
+                    crop_id,
+                    year,
+                    name,
+                    started_at,
+                    ended_at,
+                    status,
+                    close_reason
+                ) VALUES (
+                    {enterprise_id},
+                    {field_id},
+                    {crop_id},
+                    {year},
+                    {_sql_quote(name)},
+                    {_sql_quote(started_at)}::date,
+                    {(_sql_quote(ended_at) + '::date') if ended_at else 'NULL'},
+                    {_sql_quote(status)},
+                    {close_reason_sql}
+                )
+                RETURNING
+                    id,
+                    enterprise_id,
+                    field_id,
+                    crop_id,
+                    year,
+                    name,
+                    status,
+                    started_at,
+                    ended_at,
+                    close_reason,
+                    created_at
+            )
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    i.id,
+                    i.enterprise_id,
+                    i.field_id,
+                    i.crop_id,
+                    c.name AS crop_name,
+                    i.year,
+                    i.name,
+                    i.status,
+                    i.started_at,
+                    i.ended_at,
+                    i.close_reason,
+                    to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM ins i
+                JOIN crops c ON c.id = i.crop_id
+            ) x;
+            """
+        )
+        assert isinstance(created, dict)
+        self._write_audit(db, user.user_id, "season.create", "season", str(created["id"]), None, created, request_id)
+        return created
+
+    def _get_season(self, db: DbClient, user: UserContext, season_id: int) -> dict[str, Any]:
+        where_parts = [f"s.id = {season_id}"]
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"s.enterprise_id = {user.enterprise_id}")
+
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    s.id,
+                    s.enterprise_id,
+                    s.field_id,
+                    s.crop_id,
+                    c.name AS crop_name,
+                    s.year,
+                    s.name,
+                    s.status,
+                    s.started_at,
+                    s.ended_at,
+                    s.close_reason,
+                    to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM seasons s
+                JOIN crops c ON c.id = s.crop_id
+                WHERE {' AND '.join(where_parts)}
+            ) x;
+            """
+        )
+
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+        return payload
+
+    def _update_season(
+        self,
+        db: DbClient,
+        user: UserContext,
+        season_id: int,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._get_season(db, user, season_id)
+
+        field_id = int(before.get("field_id") or 0)
+        if field_id <= 0:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: season не привязан к полю", status=422)
+
+        started_at = self._date_optional(payload.get("started_at"), "started_at") or str(before.get("started_at"))
+        ended_at = self._date_optional(payload.get("ended_at"), "ended_at")
+        if ended_at is None and before.get("ended_at"):
+            ended_at = str(before.get("ended_at"))
+
+        status = payload.get("status", before.get("status"))
+        status = self._str_value(status, "status", min_len=6, max_len=10)
+        if status not in {"active", "archived"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: status", status=422)
+
+        close_reason_input = payload.get("close_reason", before.get("close_reason"))
+        close_reason_sql = (
+            _sql_quote(self._str_value(close_reason_input, "close_reason", min_len=2, max_len=1000))
+            if close_reason_input
+            else "NULL"
+        )
+
+        if status == "archived" and close_reason_sql == "NULL":
+            raise ApiError(
+                "VALIDATION_ERROR",
+                "Некорректные входные данные: сезон нельзя закрыть без обязательных данных",
+                status=422,
+            )
+
+        self._ensure_no_active_season_overlap(db, field_id, started_at, ended_at, exclude_id=season_id, status=status)
+
+        name = payload.get("name", before.get("name"))
+        name = self._str_value(name, "name", min_len=2, max_len=250)
+
+        db.exec_checked(
+            f"""
+            UPDATE seasons
+            SET
+                name = {_sql_quote(name)},
+                started_at = {_sql_quote(started_at)}::date,
+                ended_at = {(_sql_quote(ended_at) + '::date') if ended_at else 'NULL'},
+                status = {_sql_quote(status)},
+                close_reason = {close_reason_sql}
+            WHERE id = {season_id};
+            """
+        )
+
+        after = self._get_season(db, user, season_id)
+        self._write_audit(db, user.user_id, "season.update", "season", str(season_id), before, after, request_id)
+        return after
+
+    def _ensure_no_active_season_overlap(
+        self,
+        db: DbClient,
+        field_id: int,
+        started_at: str,
+        ended_at: str | None,
+        *,
+        exclude_id: int | None,
+        status: str,
+    ) -> None:
+        if status != "active":
+            return
+
+        end_value = ended_at or "infinity"
+        exclude_sql = f"AND id <> {exclude_id}" if exclude_id is not None else ""
+
+        overlap_count = db.exec_checked(
+            f"""
+            SELECT COUNT(*)
+            FROM seasons
+            WHERE field_id = {field_id}
+              AND status = 'active'
+              {exclude_sql}
+              AND daterange(started_at, COALESCE(ended_at, 'infinity'::date), '[]')
+                  && daterange({_sql_quote(started_at)}::date, COALESCE({_sql_quote(end_value)}::date, 'infinity'::date), '[]');
+            """,
+            tuples_only=True,
+        )
+
+        if self._scalar_int(overlap_count) > 0:
+            raise ApiError(
+                "VALIDATION_ERROR",
+                "Некорректные входные данные: пересечение активных сезонов на одном поле",
+                status=422,
+            )
+
+    # -------------------------------
+    # Data endpoints
+    # -------------------------------
+    def _get_weather_series(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        granularity = self._query_str(query, "granularity", required=False) or "day"
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+
+        report = query_range(
+            db,
+            source=source,
+            field_id=field_id,
+            range_start=range_start,
+            range_end=range_end,
+            granularity=granularity,
+        )
+
+        records = [item for item in report.get("records", []) if item.get("metric") in WEATHER_METRICS]
+        summary = [item for item in report.get("summary", []) if item.get("metric") in WEATHER_METRICS]
+        bins = report.get("time_bins", [])
+
+        coverage = self._coverage_percent(range_start, range_end, len(records), len(WEATHER_METRICS))
+        last_sync = report.get("last_sync", {}).get("last_success_at") or report.get("last_sync", {}).get("last_sync_at")
+
+        result = {
+            "field_id": field_id,
+            "source": source,
+            "granularity": granularity,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "values": records,
+            "summary": summary,
+            "time_bins": bins,
+            "meta": {
+                "last_sync_at": last_sync,
+                "data_coverage": coverage,
+                "contract_version": CONTRACT_VERSION,
+            },
+        }
+        return result, len(records) == 0
+
+    def _get_weather_summary(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        series, no_data = self._get_weather_series(db, user, field_id, query)
+
+        totals: dict[str, dict[str, Any]] = {}
+        for record in series.get("values", []):
+            metric = str(record.get("metric"))
+            value = float(record.get("value") or 0.0)
+            unit = str(record.get("unit") or "")
+            bucket = totals.setdefault(metric, {"metric": metric, "unit": unit, "sum": 0.0, "count": 0, "min": value, "max": value})
+            bucket["sum"] = float(bucket["sum"]) + value
+            bucket["count"] = int(bucket["count"]) + 1
+            bucket["min"] = min(float(bucket["min"]), value)
+            bucket["max"] = max(float(bucket["max"]), value)
+
+        items: list[dict[str, Any]] = []
+        for metric in sorted(totals.keys()):
+            bucket = totals[metric]
+            count = max(1, int(bucket["count"]))
+            items.append(
+                {
+                    "metric": metric,
+                    "unit": bucket["unit"],
+                    "min": round(float(bucket["min"]), 4),
+                    "max": round(float(bucket["max"]), 4),
+                    "mean": round(float(bucket["sum"]) / count, 4),
+                    "sum": round(float(bucket["sum"]), 4),
+                }
+            )
+
+        result = {
+            "field_id": field_id,
+            "source": series["source"],
+            "from": series["from"],
+            "to": series["to"],
+            "aggregates": items,
+            "meta": series["meta"],
+        }
+        return result, no_data
+
+    def _get_satellite_index(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        index_type = self._str_value(self._query_str(query, "type", required=True), "type", min_len=4, max_len=5).lower()
+        if index_type not in SATELLITE_METRICS:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: type", status=422)
+
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+
+        report = query_range(
+            db,
+            source=source,
+            field_id=field_id,
+            range_start=range_start,
+            range_end=range_end,
+            granularity="hour",
+        )
+
+        records = [item for item in report.get("records", []) if item.get("metric") == index_type]
+
+        for row in records:
+            flags = [str(flag) for flag in row.get("quality_flags", [])]
+            unreliable = any(flag in {"cloudy", "low_confidence", "cloud_mask_interpolated"} for flag in flags)
+            row["quality_status"] = "недостоверно" if unreliable else "достоверно"
+
+        last_sync = report.get("last_sync", {}).get("last_success_at") or report.get("last_sync", {}).get("last_sync_at")
+
+        result = {
+            "field_id": field_id,
+            "source": source,
+            "index_type": index_type,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "values": records,
+            "meta": {
+                "last_sync_at": last_sync,
+                "contract_version": CONTRACT_VERSION,
+            },
+        }
+        return result, len(records) == 0
+
+    def _get_satellite_scenes(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+
+        payload = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.timestamp DESC), '[]'::json)
+            FROM (
+                SELECT
+                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+                    MAX(value) FILTER (WHERE metric_code = 'ndvi') AS ndvi,
+                    MAX(value) FILTER (WHERE metric_code = 'ndre') AS ndre,
+                    MAX(value) FILTER (WHERE metric_code = 'ndmi') AS ndmi,
+                    MAX(value) FILTER (WHERE metric_code = 'cloudiness') AS cloudiness,
+                    MAX(value) FILTER (WHERE metric_code = 'cloud_mask') AS cloud_mask,
+                    source,
+                    CASE
+                        WHEN COALESCE(MAX(value) FILTER (WHERE metric_code = 'cloud_mask'), 0) >= 60 THEN 'недостоверно'
+                        WHEN COALESCE(MAX(value) FILTER (WHERE metric_code = 'cloudiness'), 0) >= 70 THEN 'недостоверно'
+                        ELSE 'достоверно'
+                    END AS quality_status
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+                  AND metric_code IN ('ndvi', 'ndre', 'ndmi', 'cloudiness', 'cloud_mask')
+                GROUP BY observed_at, source
+            ) x;
+            """
+        )
+        assert isinstance(payload, list)
+
+        last_sync = get_sync_status(db, source).get("last_success_at")
+        result = {
+            "field_id": field_id,
+            "source": source,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "scenes": payload,
+            "meta": {
+                "last_sync_at": last_sync,
+                "contract_version": CONTRACT_VERSION,
+            },
+        }
+        return result, len(payload) == 0
+
+    def _get_satellite_quality(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+
+        payload = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.timestamp DESC), '[]'::json)
+            FROM (
+                SELECT
+                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+                    metric_code AS metric,
+                    ROUND(value::numeric, 4) AS value,
+                    unit,
+                    source,
+                    quality_flags,
+                    CASE
+                        WHEN metric_code = 'cloud_mask' AND value >= 60 THEN 'недостоверно'
+                        WHEN metric_code = 'cloudiness' AND value >= 70 THEN 'недостоверно'
+                        WHEN quality_flags::text ILIKE '%cloudy%' THEN 'недостоверно'
+                        ELSE 'достоверно'
+                    END AS quality_status
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+                  AND metric_code IN ('cloudiness', 'cloud_mask')
+            ) x;
+            """
+        )
+        assert isinstance(payload, list)
+
+        last_sync = get_sync_status(db, source).get("last_success_at")
+        result = {
+            "field_id": field_id,
+            "source": source,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "quality": payload,
+            "meta": {
+                "last_sync_at": last_sync,
+                "contract_version": CONTRACT_VERSION,
+            },
+        }
+        return result, len(payload) == 0
+
+    def _sync_run(
+        self,
+        db: DbClient,
+        user: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+        idempotency_key: str | None,
+    ) -> ApiHttpResponse:
+        source = self._normalize_source(self._str_value(payload.get("source"), "source", min_len=4, max_len=20))
+        hours = self._int_value(payload.get("hours", 24), "hours", min_value=1, max_value=5000)
+        retention_days = self._int_value(payload.get("retention_days", 30), "retention_days", min_value=1, max_value=365)
+        field_id = self._int_optional(payload.get("field_id"), "field_id")
+
+        endpoint = "/api/v1/sync/run"
+        request_hash = self._request_hash(payload)
+        if idempotency_key:
+            replay = self._idempotency_lookup(db, idempotency_key, endpoint, request_hash)
+            if replay is not None:
+                return self._success(
+                    replay["data"],
+                    request_id=request_id,
+                    status=int(replay["status_code"]),
+                    user_id=user.user_id,
+                    meta_extra={"idempotent_replay": True},
+                )
+
+        report = run_sync(db, source=source, hours=hours, field_id=field_id, retention_days=retention_days)
+        self._write_audit(db, user.user_id, "sync.run", "provider", source, None, report, request_id)
+
+        status_code = 202
+        response_payload = {
+            "data": report,
+            "meta": {
+                "api_version": API_VERSION,
+                "request_id": request_id,
+            },
+        }
+
+        if idempotency_key:
+            self._idempotency_store(db, idempotency_key, endpoint, request_hash, response_payload, status_code)
+
+        return ApiHttpResponse(
+            status_code=status_code,
+            body=self._json_bytes(response_payload),
+            user_id=user.user_id,
+        )
+
+    # -------------------------------
+    # Assistant rules / alerts
+    # -------------------------------
+    def _list_assistant_rules(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        where_parts = ["1=1"]
+
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"r.enterprise_id = {user.enterprise_id}")
+
+        active_filter = self._query_str(query, "active", required=False)
+        if active_filter is not None:
+            is_active = self._as_bool(active_filter)
+            where_parts.append(f"r.is_active = {str(is_active).upper()}")
+
+        field_filter = self._query_int(query, "field_id")
+        if field_filter is not None:
+            where_parts.append(f"r.field_id = {field_filter}")
+
+        sort_sql = self._sort_clause(
+            self._query_str(query, "sort", required=False),
+            {"id", "created_at", "updated_at", "period_hours"},
+            "id",
+        )
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    r.id,
+                    r.enterprise_id,
+                    r.field_id,
+                    r.parameter,
+                    r.condition_code,
+                    r.threshold_value,
+                    r.threshold_min,
+                    r.threshold_max,
+                    r.period_hours,
+                    r.recommendation_text,
+                    r.severity,
+                    r.is_active,
+                    r.created_by,
+                    r.updated_by,
+                    to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                    to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at
+                FROM assistant_rules r
+                WHERE {' AND '.join(where_parts)}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _create_assistant_rule(
+        self,
+        db: DbClient,
+        user: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        enterprise_id = self._int_optional(payload.get("enterprise_id"), "enterprise_id")
+        field_id = self._int_optional(payload.get("field_id"), "field_id")
+
+        if field_id is not None:
+            field = self._get_field(db, user, field_id, include_deleted=False)
+            enterprise_from_field = int(field["enterprise_id"])
+            if enterprise_id is None:
+                enterprise_id = enterprise_from_field
+            if enterprise_id != enterprise_from_field:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: field/enterprise mismatch", status=422)
+
+        if enterprise_id is None:
+            if user.enterprise_id is None:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: enterprise_id обязателен", status=422)
+            enterprise_id = user.enterprise_id
+
+        self._assert_enterprise_scope(user, enterprise_id)
+
+        parameter = self._str_value(payload.get("parameter"), "parameter", min_len=4, max_len=20)
+        if parameter not in {"wind", "precipitation", "temperature", "frost"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: parameter", status=422)
+
+        condition_code = self._str_value(payload.get("condition"), "condition", min_len=2, max_len=10)
+        if condition_code not in {"gt", "lt", "between"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: condition", status=422)
+
+        threshold_value = payload.get("threshold")
+        threshold_min = payload.get("threshold_min")
+        threshold_max = payload.get("threshold_max")
+
+        threshold_value_sql = (
+            str(float(threshold_value)) if threshold_value is not None else "NULL"
+        )
+        threshold_min_sql = str(float(threshold_min)) if threshold_min is not None else "NULL"
+        threshold_max_sql = str(float(threshold_max)) if threshold_max is not None else "NULL"
+
+        if condition_code == "between" and (threshold_min is None or threshold_max is None):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: threshold_min/threshold_max обязательны", status=422)
+
+        if condition_code in {"gt", "lt"} and threshold_value is None:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: threshold обязателен", status=422)
+
+        period_hours = self._int_value(payload.get("period_hours", 24), "period_hours", min_value=1, max_value=720)
+        recommendation_text = self._str_value(payload.get("recommendation_text"), "recommendation_text", min_len=3, max_len=1000)
+        severity = self._str_value(payload.get("severity", "warn"), "severity", min_len=4, max_len=8)
+        if severity not in {"info", "warn", "critical"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: severity", status=422)
+
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO assistant_rules (
+                    enterprise_id,
+                    field_id,
+                    parameter,
+                    condition_code,
+                    threshold_value,
+                    threshold_min,
+                    threshold_max,
+                    period_hours,
+                    recommendation_text,
+                    severity,
+                    is_active,
+                    created_by,
+                    updated_by
+                ) VALUES (
+                    {enterprise_id},
+                    {str(field_id) if field_id is not None else 'NULL'},
+                    {_sql_quote(parameter)},
+                    {_sql_quote(condition_code)},
+                    {threshold_value_sql},
+                    {threshold_min_sql},
+                    {threshold_max_sql},
+                    {period_hours},
+                    {_sql_quote(recommendation_text)},
+                    {_sql_quote(severity)},
+                    TRUE,
+                    {user.user_id},
+                    {user.user_id}
+                )
+                RETURNING *
+            )
+            SELECT row_to_json(ins) FROM ins;
+            """
+        )
+        assert isinstance(created, dict)
+        self._write_audit(db, user.user_id, "assistant.rule.create", "assistant_rule", str(created["id"]), None, created, request_id)
+        return created
+
+    def _update_assistant_rule(
+        self,
+        db: DbClient,
+        user: UserContext,
+        rule_id: int,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._get_assistant_rule(db, user, rule_id)
+
+        recommendation_text = payload.get("recommendation_text", before.get("recommendation_text"))
+        recommendation_text = self._str_value(recommendation_text, "recommendation_text", min_len=3, max_len=1000)
+
+        severity = payload.get("severity", before.get("severity"))
+        severity = self._str_value(severity, "severity", min_len=4, max_len=8)
+        if severity not in {"info", "warn", "critical"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: severity", status=422)
+
+        is_active = payload.get("is_active", before.get("is_active"))
+        is_active_bool = self._bool_value(is_active, "is_active")
+
+        db.exec_checked(
+            f"""
+            UPDATE assistant_rules
+            SET
+                recommendation_text = {_sql_quote(recommendation_text)},
+                severity = {_sql_quote(severity)},
+                is_active = {str(is_active_bool).upper()},
+                updated_by = {user.user_id},
+                updated_at = NOW()
+            WHERE id = {rule_id};
+            """
+        )
+
+        after = self._get_assistant_rule(db, user, rule_id)
+        self._write_audit(db, user.user_id, "assistant.rule.update", "assistant_rule", str(rule_id), before, after, request_id)
+        return after
+
+    def _archive_assistant_rule(
+        self,
+        db: DbClient,
+        user: UserContext,
+        rule_id: int,
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._get_assistant_rule(db, user, rule_id)
+        db.exec_checked(
+            f"""
+            UPDATE assistant_rules
+            SET is_active = FALSE, updated_at = NOW(), updated_by = {user.user_id}
+            WHERE id = {rule_id};
+            """
+        )
+        after = self._get_assistant_rule(db, user, rule_id)
+        self._write_audit(db, user.user_id, "assistant.rule.archive", "assistant_rule", str(rule_id), before, after, request_id)
+        return after
+
+    def _get_assistant_rule(self, db: DbClient, user: UserContext, rule_id: int) -> dict[str, Any]:
+        where_parts = [f"id = {rule_id}"]
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"enterprise_id = {user.enterprise_id}")
+
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(r)
+            FROM (
+                SELECT * FROM assistant_rules WHERE {' AND '.join(where_parts)}
+            ) r;
+            """
+        )
+        if not isinstance(payload, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+        return payload
+
+    def _get_assistant_alerts(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        enterprise_id = int(field["enterprise_id"])
+        self._assert_enterprise_scope(user, enterprise_id)
+
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+
+        rules = self._load_applicable_rules(db, enterprise_id, field_id)
+        alerts: list[dict[str, Any]] = []
+
+        for rule in rules:
+            evaluation = self._evaluate_rule(db, rule, field_id, range_start, range_end)
+            if not evaluation["triggered"]:
+                continue
+
+            alerts.append(
+                {
+                    "rule_id": rule["id"],
+                    "type": rule["parameter"],
+                    "level": rule["severity"],
+                    "reason": evaluation["reason"],
+                    "evidence": evaluation["evidence"],
+                    "triggered_at": _iso_utc(datetime.now(timezone.utc)),
+                    "recommendation": rule["recommendation_text"],
+                }
+            )
+
+        return {
+            "field_id": field_id,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "alerts": alerts,
+        }
+
+    def _get_assistant_recommendations(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        enterprise_id = int(field["enterprise_id"])
+        self._assert_enterprise_scope(user, enterprise_id)
+
+        at = self._parse_datetime(self._query_str(query, "at", required=True))
+        rules = self._load_applicable_rules(db, enterprise_id, field_id)
+
+        recommendations: list[dict[str, Any]] = []
+        for rule in rules:
+            period_hours = int(rule["period_hours"])
+            range_start = at - timedelta(hours=period_hours)
+            evaluation = self._evaluate_rule(db, rule, field_id, range_start, at)
+            if not evaluation["triggered"]:
+                continue
+
+            recommendations.append(
+                {
+                    "rule_id": rule["id"],
+                    "what_to_do": rule["recommendation_text"],
+                    "why": evaluation["reason"],
+                    "data_quality": evaluation["quality"],
+                    "level": rule["severity"],
+                    "at": _iso_utc(at),
+                }
+            )
+
+        return {
+            "field_id": field_id,
+            "at": _iso_utc(at),
+            "recommendations": recommendations,
+        }
+
+    def _create_assistant_decision(
+        self,
+        db: DbClient,
+        user: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        field_id = self._int_value(payload.get("field_id"), "field_id", min_value=1)
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        rule_id = self._int_optional(payload.get("rule_id"), "rule_id")
+        decision = self._str_value(payload.get("decision"), "decision", min_len=5, max_len=10)
+        if decision not in {"shown", "confirmed", "rejected"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: decision", status=422)
+
+        recommendation_text = payload.get("recommendation_text")
+        recommendation_sql = (
+            _sql_quote(self._str_value(recommendation_text, "recommendation_text", min_len=2, max_len=1000))
+            if recommendation_text
+            else "NULL"
+        )
+
+        reason_json = payload.get("reason", {})
+        if not isinstance(reason_json, dict):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: reason", status=422)
+
+        created = db.query_json(
+            f"""
+            WITH ins AS (
+                INSERT INTO assistant_decision_journal (
+                    field_id,
+                    rule_id,
+                    user_id,
+                    decision,
+                    recommendation_text,
+                    reason,
+                    request_id,
+                    shown_at,
+                    decided_at
+                ) VALUES (
+                    {field_id},
+                    {str(rule_id) if rule_id is not None else 'NULL'},
+                    {user.user_id},
+                    {_sql_quote(decision)},
+                    {recommendation_sql},
+                    {_sql_quote(json.dumps(reason_json, ensure_ascii=False))}::jsonb,
+                    {_sql_quote(request_id)},
+                    NOW(),
+                    CASE WHEN {_sql_quote(decision)} = 'shown' THEN NULL ELSE NOW() END
+                )
+                RETURNING *
+            )
+            SELECT row_to_json(ins) FROM ins;
+            """
+        )
+        assert isinstance(created, dict)
+        self._write_audit(
+            db,
+            user.user_id,
+            "assistant.decision.create",
+            "assistant_decision",
+            str(created["id"]),
+            None,
+            created,
+            request_id,
+        )
+        return created
+
+    def _list_assistant_decisions(self, db: DbClient, user: UserContext, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        where_parts = ["1=1"]
+
+        field_id = self._query_int(query, "field_id")
+        if field_id is not None:
+            field = self._get_field(db, user, field_id, include_deleted=False)
+            self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+            where_parts.append(f"d.field_id = {field_id}")
+
+        if user.role_code != ROLE_ADMIN and user.enterprise_id is not None:
+            where_parts.append(f"f.enterprise_id = {user.enterprise_id}")
+
+        sort_sql = self._sort_clause(
+            self._query_str(query, "sort", required=False),
+            {"id", "shown_at", "created_at"},
+            "shown_at",
+        )
+
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    d.id,
+                    d.field_id,
+                    d.rule_id,
+                    d.user_id,
+                    d.decision,
+                    d.recommendation_text,
+                    d.reason,
+                    d.request_id,
+                    to_char(d.shown_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS shown_at,
+                    CASE
+                        WHEN d.decided_at IS NULL THEN NULL
+                        ELSE to_char(d.decided_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    END AS decided_at,
+                    to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM assistant_decision_journal d
+                JOIN fields f ON f.id = d.field_id
+                WHERE {' AND '.join(where_parts)}
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY {sort_sql}
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def _load_applicable_rules(self, db: DbClient, enterprise_id: int, field_id: int) -> list[dict[str, Any]]:
+        payload = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(r)), '[]'::json)
+            FROM (
+                SELECT *
+                FROM assistant_rules
+                WHERE is_active = TRUE
+                  AND enterprise_id = {enterprise_id}
+                  AND (field_id IS NULL OR field_id = {field_id})
+                ORDER BY id
+            ) r;
+            """
+        )
+        assert isinstance(payload, list)
+        return payload
+
+    def _evaluate_rule(
+        self,
+        db: DbClient,
+        rule: dict[str, Any],
+        field_id: int,
+        range_start: datetime,
+        range_end: datetime,
+    ) -> dict[str, Any]:
+        metric = self._metric_for_rule(str(rule["parameter"]))
+
+        records = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(r) ORDER BY r.observed_at), '[]'::json)
+            FROM (
+                SELECT
+                    metric_code,
+                    value,
+                    unit,
+                    quality_flags,
+                    observed_at
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND metric_code = {_sql_quote(metric)}
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+            ) r;
+            """
+        )
+        assert isinstance(records, list)
+
+        if not records:
+            return {
+                "triggered": False,
+                "reason": "Недостаточно данных",
+                "evidence": {"count": 0},
+                "quality": "low",
+            }
+
+        values = [float(item.get("value") or 0.0) for item in records]
+        unit = str(records[0].get("unit") or "")
+
+        if metric == "precipitation":
+            observed = sum(values)
+            observed_label = "sum"
+        elif metric in {"wind_speed", "temperature"}:
+            if str(rule["parameter"]) == "frost":
+                observed = min(values)
+                observed_label = "min"
+            else:
+                observed = max(values)
+                observed_label = "max"
+        else:
+            observed = sum(values)
+            observed_label = "sum"
+
+        condition_code = str(rule["condition_code"])
+        triggered = False
+        condition_text = ""
+
+        if condition_code == "gt":
+            threshold = float(rule.get("threshold_value") or 0.0)
+            triggered = observed > threshold
+            condition_text = f"{observed:.4f} {unit} > {threshold:.4f} {unit}"
+        elif condition_code == "lt":
+            threshold = float(rule.get("threshold_value") or 0.0)
+            triggered = observed < threshold
+            condition_text = f"{observed:.4f} {unit} < {threshold:.4f} {unit}"
+        else:
+            min_v = float(rule.get("threshold_min") or 0.0)
+            max_v = float(rule.get("threshold_max") or 0.0)
+            triggered = min_v <= observed <= max_v
+            condition_text = f"{min_v:.4f} {unit} <= {observed:.4f} {unit} <= {max_v:.4f} {unit}"
+
+        quality = "ok"
+        for row in records:
+            flags = [str(flag) for flag in row.get("quality_flags", [])]
+            if any(flag in {"cloudy", "low_confidence", "cloud_mask_interpolated"} for flag in flags):
+                quality = "low"
+                break
+
+        return {
+            "triggered": triggered,
+            "reason": f"{rule['parameter']}: {condition_text}",
+            "evidence": {
+                "metric": metric,
+                "aggregation": observed_label,
+                "observed": round(observed, 4),
+                "unit": unit,
+                "points": len(records),
+            },
+            "quality": quality,
+        }
+
+    @staticmethod
+    def _metric_for_rule(parameter: str) -> str:
+        mapping = {
+            "wind": "wind_speed",
+            "precipitation": "precipitation",
+            "temperature": "temperature",
+            "frost": "temperature",
+        }
+        metric = mapping.get(parameter)
+        if not metric:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: parameter", status=422)
+        return metric
+
+    # -------------------------------
+    # Export jobs + TTL
+    # -------------------------------
+    def _create_export_job(
+        self,
+        db: DbClient,
+        user: UserContext,
+        payload: dict[str, Any],
+        request_id: str,
+        idempotency_key: str | None,
+    ) -> ApiHttpResponse:
+        entity = self._str_value(payload.get("entity"), "entity", min_len=5, max_len=20)
+        if entity not in {"weather", "satellite", "assistant"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: entity", status=422)
+
+        source = self._normalize_source(
+            self._str_value(payload.get("source", "Copernicus"), "source", min_len=4, max_len=20)
+        )
+        granularity = self._str_value(payload.get("granularity", "day"), "granularity", min_len=3, max_len=10)
+        if granularity not in {"month", "day", "hour", "point"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: granularity", status=422)
+
+        export_format = self._str_value(payload.get("format", "json"), "format", min_len=3, max_len=10)
+        if export_format not in {"json", "csv"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: format", status=422)
+
+        range_start = self._parse_datetime(self._str_value(payload.get("from"), "from", min_len=10, max_len=40))
+        range_end = self._parse_datetime(self._str_value(payload.get("to"), "to", min_len=10, max_len=40))
+        if range_end < range_start:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: конец диапазона меньше начала", status=422)
+
+        field_ids_raw = payload.get("field_ids")
+        if not isinstance(field_ids_raw, list) or not field_ids_raw:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: field_ids", status=422)
+
+        field_ids: list[int] = []
+        for raw in field_ids_raw:
+            field_id = self._int_value(raw, "field_id", min_value=1)
+            field = self._get_field(db, user, field_id, include_deleted=False)
+            self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+            field_ids.append(field_id)
+
+        endpoint = "/api/v1/export"
+        request_hash = self._request_hash(payload)
+        if idempotency_key:
+            replay = self._idempotency_lookup(db, idempotency_key, endpoint, request_hash)
+            if replay is not None:
+                return self._success(
+                    replay["data"],
+                    request_id=request_id,
+                    status=int(replay["status_code"]),
+                    user_id=user.user_id,
+                    meta_extra={"idempotent_replay": True},
+                )
+
+        export_id = uuid.uuid4().hex
+
+        db.exec_checked(
+            f"""
+            INSERT INTO api_export_jobs (
+                export_id,
+                entity,
+                source,
+                field_ids,
+                range_start,
+                range_end,
+                granularity,
+                export_format,
+                status,
+                request_meta,
+                idempotency_key,
+                created_by,
+                created_at,
+                updated_at,
+                expires_at
+            ) VALUES (
+                {_sql_quote(export_id)},
+                {_sql_quote(entity)},
+                {_sql_quote(source)},
+                {_sql_quote(json.dumps(field_ids))}::jsonb,
+                {_sql_quote(_iso_utc(range_start))}::timestamptz,
+                {_sql_quote(_iso_utc(range_end))}::timestamptz,
+                {_sql_quote(granularity)},
+                {_sql_quote(export_format)},
+                'pending',
+                {_sql_quote(json.dumps({"request_id": request_id}, ensure_ascii=False))}::jsonb,
+                {(_sql_quote(idempotency_key) if idempotency_key else 'NULL')},
+                {user.user_id},
+                NOW(),
+                NOW(),
+                NOW() + INTERVAL '30 days'
+            );
+            """
+        )
+
+        payload_data = self._load_export_job(db, export_id)
+        assert isinstance(payload_data, dict)
+        self._write_audit(db, user.user_id, "export.create", "export_job", export_id, None, payload_data, request_id)
+
+        status_code = 202
+        envelope = {
+            "data": payload_data,
+            "meta": {
+                "api_version": API_VERSION,
+                "request_id": request_id,
+            },
+        }
+        if idempotency_key:
+            self._idempotency_store(db, idempotency_key, endpoint, request_hash, envelope, status_code)
+
+        return ApiHttpResponse(status_code=status_code, body=self._json_bytes(envelope), user_id=user.user_id)
+
+    def _get_export_job(self, db: DbClient, user: UserContext, export_id: str) -> dict[str, Any]:
+        job = self._load_export_job(db, export_id)
+        if not isinstance(job, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+
+        field_ids = [int(x) for x in (job.get("field_ids") or [])]
+        for field_id in field_ids:
+            field = self._get_field(db, user, field_id, include_deleted=True)
+            self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        if str(job.get("status")) in {"pending", "running"}:
+            self._process_export_job(db, job)
+            job = self._load_export_job(db, export_id)
+            assert isinstance(job, dict)
+
+        return job
+
+    def _load_export_job(self, db: DbClient, export_id: str) -> dict[str, Any] | None:
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    export_id,
+                    entity,
+                    source,
+                    field_ids,
+                    to_char(range_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS range_start,
+                    to_char(range_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS range_end,
+                    granularity,
+                    export_format,
+                    status,
+                    file_path,
+                    error_text,
+                    request_meta,
+                    idempotency_key,
+                    created_by,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS updated_at,
+                    to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS expires_at,
+                    CASE
+                        WHEN warned_at IS NULL THEN NULL
+                        ELSE to_char(warned_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                    END AS warned_at,
+                    extended_count
+                FROM api_export_jobs
+                WHERE export_id = {_sql_quote(export_id)}
+            ) x;
+            """
+        )
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _process_export_job(self, db: DbClient, job: dict[str, Any]) -> None:
+        export_id = str(job["export_id"])
+        status = str(job.get("status") or "")
+        if status not in {"pending", "running"}:
+            return
+
+        db.exec_checked(
+            f"""
+            UPDATE api_export_jobs
+            SET status = 'running', error_text = NULL, updated_at = NOW()
+            WHERE export_id = {_sql_quote(export_id)};
+            """
+        )
+
+        try:
+            rows = self._collect_export_rows(db, job)
+            export_format = str(job.get("export_format") or "json")
+            EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            if export_format == "json":
+                file_path = EXPORTS_DIR / f"{export_id}.json"
+                file_payload = {
+                    "export_id": export_id,
+                    "entity": job.get("entity"),
+                    "source": job.get("source"),
+                    "field_ids": job.get("field_ids"),
+                    "from": job.get("range_start"),
+                    "to": job.get("range_end"),
+                    "granularity": job.get("granularity"),
+                    "rows": rows,
+                }
+                file_path.write_text(json.dumps(file_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                file_path = EXPORTS_DIR / f"{export_id}.csv"
+                with file_path.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=sorted({k for row in rows for k in row.keys()}))
+                    writer.writeheader()
+                    for row in rows:
+                        writer.writerow(row)
+
+            db.exec_checked(
+                f"""
+                UPDATE api_export_jobs
+                SET status = 'done',
+                    file_path = {_sql_quote(str(file_path.relative_to(ROOT)))},
+                    error_text = NULL,
+                    updated_at = NOW()
+                WHERE export_id = {_sql_quote(export_id)};
+                """
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.exec_checked(
+                f"""
+                UPDATE api_export_jobs
+                SET status = 'failed',
+                    error_text = {_sql_quote(str(exc)[:1500])},
+                    updated_at = NOW()
+                WHERE export_id = {_sql_quote(export_id)};
+                """
+            )
+
+    def _collect_export_rows(self, db: DbClient, job: dict[str, Any]) -> list[dict[str, Any]]:
+        export_id = str(job["export_id"])
+        entity = str(job["entity"])
+        source = str(job["source"])
+        field_ids = [int(x) for x in (job.get("field_ids") or [])]
+        from_ts = str(job["range_start"])
+        to_ts = str(job["range_end"])
+
+        field_ids_sql = ",".join(str(field_id) for field_id in field_ids) or "-1"
+
+        if entity == "assistant":
+            payload = db.query_json(
+                f"""
+                SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.shown_at DESC), '[]'::json)
+                FROM (
+                    SELECT
+                        id,
+                        field_id,
+                        rule_id,
+                        user_id,
+                        decision,
+                        recommendation_text,
+                        reason,
+                        request_id,
+                        to_char(shown_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS shown_at
+                    FROM assistant_decision_journal
+                    WHERE field_id IN ({field_ids_sql})
+                      AND shown_at BETWEEN {_sql_quote(from_ts)}::timestamptz
+                                      AND {_sql_quote(to_ts)}::timestamptz
+                ) x;
+                """
+            )
+            assert isinstance(payload, list)
+            return payload
+
+        metric_filter = WEATHER_METRICS if entity == "weather" else (SATELLITE_METRICS | SATELLITE_QUALITY_METRICS)
+        metrics_sql = ",".join(_sql_quote(metric) for metric in sorted(metric_filter))
+        payload = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.timestamp DESC, x.metric), '[]'::json)
+            FROM (
+                SELECT
+                    field_id,
+                    metric_code AS metric,
+                    ROUND(value::numeric, 4)::double precision AS value,
+                    unit,
+                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+                    source,
+                    quality_flags,
+                    meta
+                FROM provider_observations
+                WHERE field_id IN ({field_ids_sql})
+                  AND source = {_sql_quote(source)}
+                  AND metric_code IN ({metrics_sql})
+                  AND observed_at BETWEEN {_sql_quote(from_ts)}::timestamptz
+                                      AND {_sql_quote(to_ts)}::timestamptz
+            ) x;
+            """
+        )
+        assert isinstance(payload, list)
+        return payload
+
+    def _extend_export_job(
+        self,
+        db: DbClient,
+        user: UserContext,
+        export_id: str,
+        days: int,
+        request_id: str,
+    ) -> dict[str, Any]:
+        before = self._load_export_job(db, export_id)
+        if not isinstance(before, dict):
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404)
+
+        db.exec_checked(
+            f"""
+            UPDATE api_export_jobs
+            SET expires_at = expires_at + INTERVAL '{int(days)} days',
+                warned_at = NULL,
+                extended_count = extended_count + 1,
+                updated_at = NOW()
+            WHERE export_id = {_sql_quote(export_id)};
+            """
+        )
+        after = self._load_export_job(db, export_id)
+        assert isinstance(after, dict)
+        self._write_audit(db, user.user_id, "export.extend", "export_job", export_id, before, after, request_id)
+        return after
+
+    def _download_export_job(
+        self,
+        db: DbClient,
+        user: UserContext,
+        export_id: str,
+        request_id: str,
+    ) -> ApiHttpResponse:
+        job = self._get_export_job(db, user, export_id)
+        if str(job.get("status")) != "done":
+            raise ApiError("CONFLICT", "Конфликт состояния (повторная операция)", status=409, details="Экспорт не готов")
+
+        file_path_raw = job.get("file_path")
+        if not isinstance(file_path_raw, str) or not file_path_raw:
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404, details="Файл экспорта отсутствует")
+
+        file_path = ROOT / file_path_raw
+        if not file_path.exists():
+            raise ApiError("NOT_FOUND", "Объект не найден", status=404, details="Файл экспорта не найден")
+
+        content = file_path.read_bytes()
+        filename = file_path.name
+        content_type = "application/json" if filename.endswith(".json") else "text/csv; charset=utf-8"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-API-Version": API_VERSION,
+            "X-Request-ID": request_id,
+        }
+        return ApiHttpResponse(
+            status_code=200,
+            body=content,
+            content_type=content_type,
+            headers=headers,
+            user_id=user.user_id,
+        )
+
+    # -------------------------------
+    # Metrics / audit
+    # -------------------------------
+    def _build_metrics_overview(self, db: DbClient) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(minutes=5)
+        since_iso = _iso_utc(since)
+
+        summary = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    COUNT(*)::int AS total_requests,
+                    ROUND(COALESCE(COUNT(*) / 300.0, 0)::numeric, 4) AS rps_5m,
+                    ROUND(COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::numeric, 2) AS latency_p95_ms,
+                    ROUND(
+                        CASE WHEN COUNT(*) = 0 THEN 0
+                             ELSE (COUNT(*) FILTER (WHERE error_code = 'NO_DATA')::numeric / COUNT(*)::numeric) * 100
+                        END,
+                        2
+                    ) AS no_data_share_percent
+                FROM api_request_log
+                WHERE created_at >= {_sql_quote(since_iso)}::timestamptz
+            ) x;
+            """
+        )
+        assert isinstance(summary, dict)
+
+        errors = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+            FROM (
+                SELECT COALESCE(error_code, 'NONE') AS error_code, COUNT(*)::int AS total
+                FROM api_request_log
+                WHERE created_at >= {_sql_quote(since_iso)}::timestamptz
+                GROUP BY COALESCE(error_code, 'NONE')
+                ORDER BY error_code
+            ) x;
+            """
+        )
+        assert isinstance(errors, list)
+
+        sync_stats = db.query_json(
+            """
+            SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+            FROM (
+                SELECT source, status, last_sync_at, last_success_at, last_error
+                FROM provider_sync_status
+                ORDER BY source
+            ) x;
+            """
+        )
+        assert isinstance(sync_stats, list)
+
+        return {
+            "window_minutes": 5,
+            "summary": summary,
+            "errors_by_code": errors,
+            "sync_status": sync_stats,
+        }
+
+    def _list_audit_log(self, db: DbClient, query: dict[str, list[str]]) -> dict[str, Any]:
+        page, page_size, offset = self._pagination(query)
+        payload = db.query_json(
+            f"""
+            WITH base AS (
+                SELECT
+                    id,
+                    user_id,
+                    action,
+                    object_type,
+                    object_id,
+                    before_state,
+                    after_state,
+                    request_id,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at
+                FROM api_audit_log
+            ),
+            paged AS (
+                SELECT * FROM base
+                ORDER BY id DESC
+                LIMIT {page_size}
+                OFFSET {offset}
+            )
+            SELECT json_build_object(
+                'items', COALESCE((SELECT json_agg(row_to_json(p)) FROM paged p), '[]'::json),
+                'page', {page},
+                'page_size', {page_size},
+                'total', (SELECT COUNT(*)::int FROM base)
+            );
+            """
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    # -------------------------------
+    # Shared helpers
+    # -------------------------------
+    def _write_audit(
+        self,
+        db: DbClient,
+        user_id: int | None,
+        action: str,
+        object_type: str,
+        object_id: str | None,
+        before_state: Any,
+        after_state: Any,
+        request_id: str,
+    ) -> None:
+        db.exec_checked(
+            f"""
+            INSERT INTO api_audit_log (
+                user_id,
+                action,
+                object_type,
+                object_id,
+                before_state,
+                after_state,
+                request_id
+            ) VALUES (
+                {str(user_id) if user_id is not None else 'NULL'},
+                {_sql_quote(action)},
+                {_sql_quote(object_type)},
+                {(_sql_quote(object_id) if object_id else 'NULL')},
+                {(_sql_quote(json.dumps(before_state, ensure_ascii=False)) + '::jsonb') if before_state is not None else 'NULL'},
+                {(_sql_quote(json.dumps(after_state, ensure_ascii=False)) + '::jsonb') if after_state is not None else 'NULL'},
+                {_sql_quote(request_id)}
+            );
+            """
+        )
+
+    def _idempotency_lookup(
+        self,
+        db: DbClient,
+        key: str,
+        endpoint: str,
+        request_hash: str,
+    ) -> dict[str, Any] | None:
+        payload = db.query_json(
+            f"""
+            SELECT row_to_json(x)
+            FROM (
+                SELECT
+                    endpoint,
+                    request_hash,
+                    response_payload,
+                    status_code
+                FROM api_idempotency_keys
+                WHERE idempotency_key = {_sql_quote(key)}
+            ) x;
+            """
+        )
+        if not isinstance(payload, dict):
+            return None
+
+        if str(payload.get("endpoint")) != endpoint or str(payload.get("request_hash")) != request_hash:
+            raise ApiError(
+                "CONFLICT",
+                "Конфликт состояния (повторная операция)",
+                status=409,
+                details="Idempotency-Key уже использован с другим запросом",
+            )
+
+        response_payload = payload.get("response_payload")
+        if not isinstance(response_payload, dict):
+            raise ApiError("CONFLICT", "Конфликт состояния (повторная операция)", status=409)
+
+        return {
+            "data": response_payload.get("data"),
+            "status_code": int(payload.get("status_code") or 200),
+        }
+
+    def _idempotency_store(
+        self,
+        db: DbClient,
+        key: str,
+        endpoint: str,
+        request_hash: str,
+        response_payload: dict[str, Any],
+        status_code: int,
+    ) -> None:
+        db.exec_checked(
+            f"""
+            INSERT INTO api_idempotency_keys (
+                idempotency_key,
+                endpoint,
+                request_hash,
+                response_payload,
+                status_code
+            ) VALUES (
+                {_sql_quote(key)},
+                {_sql_quote(endpoint)},
+                {_sql_quote(request_hash)},
+                {_sql_quote(json.dumps(response_payload, ensure_ascii=False))}::jsonb,
+                {int(status_code)}
+            )
+            ON CONFLICT (idempotency_key) DO UPDATE
+            SET endpoint = EXCLUDED.endpoint,
+                request_hash = EXCLUDED.request_hash,
+                response_payload = EXCLUDED.response_payload,
+                status_code = EXCLUDED.status_code;
+            """
+        )
+
+    @staticmethod
+    def _request_hash(payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _geometry_sql(self, payload: dict[str, Any]) -> str:
+        srid = self._int_value(payload.get("srid", 4326), "srid", min_value=1, max_value=999999)
+        if srid != 4326:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: ожидается SRID EPSG:4326", status=422)
+
+        if payload.get("geojson") is not None:
+            geojson = payload["geojson"]
+            if isinstance(geojson, dict):
+                geojson_text = json.dumps(geojson, ensure_ascii=False)
+            else:
+                raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: geojson", status=422)
+            return f"ST_SetSRID(ST_GeomFromGeoJSON($${geojson_text}$$), 4326)"
+
+        if payload.get("geometry") is not None:
+            geometry = payload["geometry"]
+            if isinstance(geometry, dict):
+                geojson_text = json.dumps(geometry, ensure_ascii=False)
+                return f"ST_SetSRID(ST_GeomFromGeoJSON($${geojson_text}$$), 4326)"
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: geometry", status=422)
+
+        if payload.get("wkt") is not None:
+            wkt = self._str_value(payload["wkt"], "wkt", min_len=10, max_len=40000)
+            return f"ST_SetSRID(ST_GeomFromText({_sql_quote(wkt)}), 4326)"
+
+        raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: требуется geojson или wkt", status=422)
+
+    def _optional_point_sql(self, payload: dict[str, Any]) -> str:
+        point = payload.get("point")
+        if point is None:
+            return "NULL"
+        if isinstance(point, dict):
+            point_text = json.dumps(point, ensure_ascii=False)
+            return f"ST_SetSRID(ST_GeomFromGeoJSON($${point_text}$$), 4326)"
+        if isinstance(point, str):
+            return f"ST_SetSRID(ST_GeomFromText({_sql_quote(point)}), 4326)"
+        raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: point", status=422)
+
+    def _optional_zone_sql(self, payload: dict[str, Any]) -> str:
+        zone = payload.get("zone")
+        if zone is None:
+            return "NULL"
+        if isinstance(zone, dict):
+            zone_text = json.dumps(zone, ensure_ascii=False)
+            return f"ST_SetSRID(ST_GeomFromGeoJSON($${zone_text}$$), 4326)"
+        if isinstance(zone, str):
+            return f"ST_SetSRID(ST_GeomFromText({_sql_quote(zone)}), 4326)"
+        raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: zone", status=422)
+
+    @staticmethod
+    def _coverage_percent(start: datetime, end: datetime, actual_points: int, metric_count: int) -> float:
+        hours = int((end - start).total_seconds() / 3600) + 1
+        expected = max(1, hours * max(1, metric_count))
+        return round(min(100.0, (actual_points / expected) * 100.0), 2)
+
+    @staticmethod
+    def _map_geometry_error(exc: Stage3Error) -> ApiError:
+        text = str(exc)
+        if "Полигон самопересекается" in text:
+            return ApiError("VALIDATION_ERROR", "Некорректные входные данные: Полигон самопересекается", status=422)
+        if "Неверная система координат" in text:
+            return ApiError(
+                "VALIDATION_ERROR",
+                "Некорректные входные данные: Неверная система координат: ожидается EPSG:4326",
+                status=422,
+            )
+        if "Площадь поля должна быть больше 0" in text:
+            return ApiError("VALIDATION_ERROR", "Некорректные входные данные: Площадь поля должна быть больше 0", status=422)
+        return ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {text}", status=422)
+
+    def _assert_enterprise_scope(self, user: UserContext, enterprise_id: int) -> None:
+        if user.role_code == ROLE_ADMIN:
+            return
+        if user.enterprise_id != enterprise_id:
+            raise ApiError("FORBIDDEN", "Недостаточно прав", status=403)
+
+    @staticmethod
+    def _header(headers: dict[str, str], name: str) -> str | None:
+        return headers.get(name.lower())
+
+    @staticmethod
+    def _match_id(path: str, pattern: str) -> int | None:
+        match = re.match(pattern, path)
+        if not match:
+            return None
+        return int(match.group(1))
+
+    @staticmethod
+    def _match_text(path: str, pattern: str) -> str | None:
+        match = re.match(pattern, path)
+        if not match:
+            return None
+        return str(match.group(1))
+
+    def _parse_json_body(self, raw_body: bytes) -> dict[str, Any]:
+        if not raw_body:
+            return {}
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: JSON", status=422) from exc
+        if not isinstance(payload, dict):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: ожидается объект", status=422)
+        return payload
+
+    @staticmethod
+    def _json_bytes(payload: Any) -> bytes:
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def _success(
+        self,
+        data: Any,
+        *,
+        request_id: str,
+        status: int = 200,
+        user_id: int | None = None,
+        meta_extra: dict[str, Any] | None = None,
+        error_code: str | None = None,
+    ) -> ApiHttpResponse:
+        meta = {
+            "api_version": API_VERSION,
+            "request_id": request_id,
+        }
+        if meta_extra:
+            meta.update(meta_extra)
+        envelope = {"data": data, "meta": meta}
+        return ApiHttpResponse(
+            status_code=status,
+            body=self._json_bytes(envelope),
+            user_id=user_id,
+            error_code=error_code,
+        )
+
+    def error_response(self, err: ApiError, request_id: str, user_id: int | None = None) -> ApiHttpResponse:
+        payload = {
+            "api_version": API_VERSION,
+            "request_id": request_id,
+            "error": {
+                "code": err.code,
+                "message": err.message,
+                "details": err.details,
+            },
+        }
+        return ApiHttpResponse(
+            status_code=err.status,
+            body=self._json_bytes(payload),
+            error_code=err.code,
+            user_id=user_id,
+        )
+
+    def internal_error_response(self, request_id: str) -> ApiHttpResponse:
+        payload = {
+            "api_version": API_VERSION,
+            "request_id": request_id,
+            "error": {
+                "code": "SOURCE_UNAVAILABLE",
+                "message": "Источник данных недоступен: внутренняя ошибка сервера",
+                "details": None,
+            },
+        }
+        return ApiHttpResponse(
+            status_code=500,
+            body=self._json_bytes(payload),
+            error_code="SOURCE_UNAVAILABLE",
+        )
+
+    @staticmethod
+    def _no_data_meta(is_no_data: bool, reason: str) -> dict[str, Any]:
+        if not is_no_data:
+            return {"status": "OK"}
+        return {"status": "NO_DATA", "reason": reason}
+
+    def _query_str(self, query: dict[str, list[str]], name: str, *, required: bool) -> str | None:
+        values = query.get(name)
+        if not values or values[0] == "":
+            if required:
+                raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: параметр {name} обязателен", status=422)
+            return None
+        return values[0]
+
+    def _query_int(self, query: dict[str, list[str]], name: str) -> int | None:
+        value = self._query_str(query, name, required=False)
+        if value is None:
+            return None
+        return self._int_value(value, name, min_value=1)
+
+    def _query_bool(self, query: dict[str, list[str]], name: str, *, default: bool) -> bool:
+        value = self._query_str(query, name, required=False)
+        if value is None:
+            return default
+        return self._as_bool(value)
+
+    def _pagination(self, query: dict[str, list[str]]) -> tuple[int, int, int]:
+        page = self._int_optional(self._query_str(query, "page", required=False), "page") or 1
+        page_size = self._int_optional(self._query_str(query, "page_size", required=False), "page_size") or 20
+        if page < 1 or page > 100000:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: page", status=422)
+        if page_size < 1 or page_size > 200:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: page_size", status=422)
+        return page, page_size, (page - 1) * page_size
+
+    @staticmethod
+    def _sort_clause(sort_raw: str | None, allowed_fields: set[str], default_field: str) -> str:
+        if not sort_raw:
+            return f"{default_field} DESC"
+        field = sort_raw
+        direction = "ASC"
+        if sort_raw.startswith("-"):
+            field = sort_raw[1:]
+            direction = "DESC"
+        if field not in allowed_fields:
+            return f"{default_field} DESC"
+        return f"{field} {direction}"
+
+    def _normalize_source(self, raw_source: str) -> str:
+        normalized = raw_source.strip()
+        if normalized in {"Copernicus", "NASA", "Mock"}:
+            return normalized
+        mapped = SOURCE_ALIASES.get(normalized.lower())
+        if mapped is None:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: source", status=422)
+        return mapped
+
+    @staticmethod
+    def _parse_datetime(value: str) -> datetime:
+        try:
+            return _parse_ts(value)
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: timestamp", status=422) from exc
+
+    def _iso_required(self, value: Any, field_name: str) -> str:
+        if value is None:
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422)
+        return _iso_utc(self._parse_datetime(str(value)))
+
+    def _date_value(self, value: Any, field_name: str) -> str:
+        text = self._str_value(value, field_name, min_len=10, max_len=10)
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422) from exc
+        return text
+
+    def _date_optional(self, value: Any, field_name: str) -> str | None:
+        if value is None or value == "":
+            return None
+        return self._date_value(value, field_name)
+
+    @staticmethod
+    def _str_value(value: Any, field_name: str, *, min_len: int, max_len: int) -> str:
+        if value is None:
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422)
+        text = str(value).strip()
+        if len(text) < min_len or len(text) > max_len:
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422)
+        return text
+
+    @staticmethod
+    def _int_value(value: Any, field_name: str, *, min_value: int, max_value: int | None = None) -> int:
+        try:
+            parsed = int(str(value))
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422) from exc
+        if parsed < min_value:
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422)
+        if max_value is not None and parsed > max_value:
+            raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422)
+        return parsed
+
+    def _int_optional(self, value: Any, field_name: str) -> int | None:
+        if value is None or value == "":
+            return None
+        return self._int_value(value, field_name, min_value=1)
+
+    def _scalar_int(self, raw: str) -> int:
+        for line in str(raw).splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            if text.isdigit():
+                return int(text)
+            try:
+                return int(float(text))
+            except ValueError:
+                continue
+        raise ApiError("SOURCE_UNAVAILABLE", "Источник данных недоступен: не удалось прочитать число из БД", status=503)
+
+    def _bool_value(self, value: Any, field_name: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            if value in {0, 1}:
+                return bool(value)
+        if isinstance(value, str):
+            return self._as_bool(value)
+        raise ApiError("VALIDATION_ERROR", f"Некорректные входные данные: {field_name}", status=422)
+
+    @staticmethod
+    def _as_bool(text: str) -> bool:
+        normalized = text.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: bool", status=422)
+
+
+class Stage5RequestHandler(BaseHTTPRequestHandler):
+    app: Stage5ApiApp
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._handle()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._handle()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._handle()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+    def _handle(self) -> None:
+        started = time.perf_counter()
+        request_id = self.headers.get("X-Request-ID") or f"req-{uuid.uuid4().hex[:12]}"
+
+        split = urlsplit(self.path)
+        query = parse_qs(split.query, keep_blank_values=True)
+        body_len = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(body_len) if body_len > 0 else b""
+        headers = {k.lower(): v for k, v in self.headers.items()}
+
+        user_id: int | None = None
+        error_code: str | None = None
+
+        try:
+            response = self.app.handle_request(
+                method=self.command,
+                path=split.path,
+                query=query,
+                headers=headers,
+                raw_body=raw_body,
+                request_id=request_id,
+            )
+            user_id = response.user_id
+            error_code = response.error_code
+        except ApiError as err:
+            response = self.app.error_response(err, request_id=request_id, user_id=user_id)
+            error_code = err.code
+        except Exception:  # noqa: BLE001
+            response = self.app.internal_error_response(request_id=request_id)
+            error_code = "SOURCE_UNAVAILABLE"
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        self.app.record_request(
+            request_id=request_id,
+            user_id=user_id,
+            method=self.command,
+            endpoint=split.path,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+            error_code=error_code,
+        )
+
+        self.send_response(response.status_code)
+        self.send_header("Content-Type", response.content_type)
+        self.send_header("Content-Length", str(len(response.body)))
+        self.send_header("Connection", "close")
+        if "X-API-Version" not in response.headers:
+            self.send_header("X-API-Version", API_VERSION)
+        if "X-Request-ID" not in response.headers:
+            self.send_header("X-Request-ID", request_id)
+        for key, value in response.headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(response.body)
+        self.wfile.flush()
+
+
+def create_server(config: AppConfig, host: str = "0.0.0.0", port: int = 8000) -> ThreadingHTTPServer:
+    app = Stage5ApiApp(config)
+
+    class Handler(Stage5RequestHandler):
+        pass
+
+    Handler.app = app
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def process_pending_exports() -> dict[str, Any]:
+    db = DbClient()
+    db.ensure_ready()
+    app = Stage5ApiApp(AppConfig())
+    app._ensure_stage5_seed(db)
+
+    rows = db.query_json(
+        """
+        SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+        FROM (
+            SELECT
+                export_id,
+                entity,
+                source,
+                field_ids,
+                to_char(range_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS range_start,
+                to_char(range_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS range_end,
+                granularity,
+                export_format,
+                status
+            FROM api_export_jobs
+            WHERE status IN ('pending', 'running')
+            ORDER BY created_at ASC
+        ) x;
+        """
+    )
+    assert isinstance(rows, list)
+
+    processed: list[str] = []
+    for row in rows:
+        app._process_export_job(db, row)
+        processed.append(str(row.get("export_id")))
+
+    return {"processed_count": len(processed), "export_ids": processed}
+
+
+def run_export_ttl_check() -> dict[str, Any]:
+    db = DbClient()
+    db.ensure_ready()
+    warned_ids: list[str] = []
+    rows = db.query_json(
+        """
+        SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
+        FROM (
+            SELECT export_id
+            FROM api_export_jobs
+            WHERE expires_at <= (NOW() + INTERVAL '1 day')
+              AND warned_at IS NULL
+            ORDER BY expires_at ASC
+        ) x;
+        """
+    )
+    assert isinstance(rows, list)
+
+    for row in rows:
+        export_id = str(row.get("export_id"))
+        db.exec_checked(
+            f"""
+            UPDATE api_export_jobs
+            SET warned_at = NOW(),
+                updated_at = NOW()
+            WHERE export_id = {_sql_quote(export_id)};
+            """
+        )
+        warned_ids.append(export_id)
+
+    return {"warned_count": len(warned_ids), "export_ids": warned_ids}
