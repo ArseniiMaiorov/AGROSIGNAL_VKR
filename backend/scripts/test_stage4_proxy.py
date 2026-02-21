@@ -213,6 +213,36 @@ def main() -> int:
         print(f"Сформирован отчёт: {REPORT_PATH.relative_to(ROOT)}")
         return 1
 
+    # 0) Секреты proxy не сохраняются в БД
+    try:
+        settings = configure_proxy(
+            enabled=True,
+            mode="global",
+            endpoint="http://proxy-user:proxy-pass@127.0.0.1:3128",
+            copernicus_via_proxy=True,
+            nasa_via_proxy=True,
+            bypass_hosts=[],
+        )
+        endpoint = str(settings.get("proxy_endpoint") or "")
+        ok = ("proxy-user" not in endpoint) and ("proxy-pass" not in endpoint) and ("@" not in endpoint)
+        add_case(
+            cases,
+            feature="Безопасность хранения секретов proxy",
+            input_data="proxy-set с endpoint, содержащим логин/пароль",
+            expected="В ответе/БД endpoint без учётных данных",
+            ok=ok,
+            actual=f"proxy_endpoint={endpoint}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        add_case(
+            cases,
+            feature="Безопасность хранения секретов proxy",
+            input_data="proxy-set с endpoint, содержащим логин/пароль",
+            expected="В ответе/БД endpoint без учётных данных",
+            ok=False,
+            actual=str(exc),
+        )
+
     # 1) Proxy ON + invalid credentials -> 401 без ретраев
     try:
         with run_http_server(
@@ -547,8 +577,8 @@ def main() -> int:
 
     # 8) Логи: proxy_used=true/false фиксируется корректно
     try:
-        cop_log = run_cli("request-log", "--request-id", cop_request_id)
-        nasa_log = run_cli("request-log", "--request-id", nasa_request_id)
+        cop_log = run_cli("request-log", "--request-id", cop_request_id, "--admin-email", ADMIN_EMAIL)
+        nasa_log = run_cli("request-log", "--request-id", nasa_request_id, "--admin-email", ADMIN_EMAIL)
         ok = (
             bool(cop_log.get("found"))
             and bool(nasa_log.get("found"))

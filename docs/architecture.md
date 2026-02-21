@@ -8,13 +8,15 @@
 - API: Python HTTP-сервис (`/health`)
 - Сервисные режимы:
   - `stage3_cli.py` (`sync/query/export/ttl`) и циклический запуск `stage3-cycle`;
-  - `stage4_cli.py` (`proxy-set/request/health-check/metrics/degradation`).
+  - `stage4_cli.py` (`proxy-set/request/health-check/metrics/degradation`);
+  - `stage_scheduler.py` (фоновый цикл sync/export/ttl по расписанию).
 - БД: PostgreSQL + PostGIS
 - Очереди/кэш: Redis
 - Оркестрация: Docker Compose
 
 Нефункциональные требования:
 - При занятом целевом порте система автоматически выбирает свободный порт и сохраняет его в `backend/.api_port`.
+- Для локальной среды с проблемным Docker published port предусмотрен fallback: API запускается в host-процессе (`API_MODE=local`).
 
 ## Этап 2 (данные поля)
 - `fields.geom` хранится как `Polygon` в `EPSG:4326`.
@@ -24,6 +26,9 @@
 - Единый контракт данных для всех источников:
   - `value`, `unit`, `timestamp`, `source`, `quality_flags`, `meta`.
 - Провайдеры: `Copernicus`, `NASA`, `Mock`.
+- Метрики:
+  - метео: `precipitation`, `temperature`, `wind_speed`, `cloudiness`;
+  - спутниковые: `ndvi`, `ndre`, `ndmi`, `cloud_mask`.
 - Синхронизация:
   - хранится статус по источнику (`last_sync_at`, `last_success_at`, `status`, `last_error`).
 - Drill-down:
@@ -51,7 +56,7 @@
   - `bypass_hosts` + `bypass_policy` (`direct`/`force_proxy`).
 - Безопасность:
   - секреты proxy не хранятся в БД (используются env/secret-store);
-  - операции настройки требуют роль `admin` (RBAC).
+  - операции управления и чтения proxy-настроек/метрик/логов требуют роль `admin` (RBAC).
 - Health-check:
   - proxy: TCP connect + TLS handshake (для `https` proxy endpoint);
   - source: лёгкий GET-запрос к endpoint источника;

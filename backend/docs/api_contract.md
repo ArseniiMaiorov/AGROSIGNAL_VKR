@@ -33,6 +33,10 @@
 - `time_bins` следующего уровня (desc),
 - `records` в едином контракте (`value/unit/timestamp/source/quality_flags/meta`).
 
+Поддерживаемые метрики:
+- `precipitation`, `temperature`, `wind_speed`, `cloudiness`,
+- `ndvi`, `ndre`, `ndmi`, `cloud_mask`.
+
 ### Экспорт
 - `export-create --source <source> --field-id <id> --from <ISO> --to <ISO> --granularity <g> --format <json|csv>`
 - `export-process [--dataset-id <id>]`
@@ -52,7 +56,7 @@
 - `proxy-set` доступен только для пользователя с ролью `admin`.
 
 ### Конфигурация proxy
-- `proxy-get`
+- `proxy-get --admin-email <email>`
 - `proxy-set --admin-email <email> [параметры]`
 
 Ключевые параметры:
@@ -84,8 +88,8 @@
 - `source_reachability` (`status`, `http_status`, `duration_ms`, `error_class`, `reason`)
 
 ### Наблюдаемость и деградация
-- `request-log --request-id <id>`
-- `metrics`
+- `request-log --request-id <id> --admin-email <email>`
+- `metrics --admin-email <email>`
 - `degradation-status --provider <source>`
 
 Классы ошибок:

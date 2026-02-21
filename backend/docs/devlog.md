@@ -73,3 +73,23 @@
 Проверка:
 - `make test-stage4` — PASS: 401/auth, DNS, TLS, 429+retry, per-provider, bypass, логирование `proxy_used`, health-check.
 - Формируется протокол: `backend/reports/tests/<дата>_stage4_proxy.md`.
+
+## 2026-02-21 — Доводка этапов 1-4 до полного соответствия
+
+Сделано:
+- Добавлена миграция `006_stage3_extend_satellite_metrics.sql`:
+  - расширен контракт метрик наблюдений (`ndre`, `ndmi`, `cloud_mask`).
+- Добавлен фоновый планировщик `scripts/stage_scheduler.py`:
+  - автоматический цикл `sync/export/ttl` с параметрами интервала через env.
+- Добавлен единый quality-gate `scripts/run_quality_gate.py` и команда `make quality`.
+- Усилен RBAC в stage4 CLI:
+  - чтение proxy-настроек, метрик и request-log доступно только `admin`.
+- Добавлена санитизация ошибок stage4 для исключения утечки секретов в статусах/логах.
+- Для нестабильной локальной Docker-сети добавлен fallback:
+  - `make up` проверяет доступность API через published port;
+  - при недоступности автоматически переключает API в `local` режим (host process).
+
+Проверка:
+- `make up` + `make print-port` показывают `API_MODE` (`container`/`local`).
+- `curl http://127.0.0.1:<API_PORT>/health` проходит в `local` режиме.
+- `make quality` проходит без ошибок.

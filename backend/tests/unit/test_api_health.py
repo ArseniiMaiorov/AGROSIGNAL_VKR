@@ -6,7 +6,7 @@ from datetime import datetime
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from api.main import build_app_config, create_server, main
+from api.main import build_app_config, create_server, main, resolve_server_bind
 
 
 class ApiHealthTests(unittest.TestCase):
@@ -70,12 +70,15 @@ class ApiMainTests(unittest.TestCase):
                 self.started = True
 
         fake_server = FakeServer()
+        captured: dict[str, object] = {}
 
         original_create_server = create_server
         try:
             import api.main as main_module
 
-            main_module.create_server = lambda: fake_server
+            main_module.create_server = (
+                lambda host="0.0.0.0", port=8000: captured.update({"host": host, "port": port}) or fake_server
+            )
             main()
         finally:
             import api.main as main_module
@@ -83,6 +86,62 @@ class ApiMainTests(unittest.TestCase):
             main_module.create_server = original_create_server
 
         self.assertTrue(fake_server.started)
+        self.assertEqual(captured["host"], "0.0.0.0")
+        self.assertEqual(captured["port"], 8000)
+
+    def test_resolve_server_bind_defaults(self) -> None:
+        import api.main as main_module
+
+        original_environ = dict(main_module.os.environ)
+        try:
+            main_module.os.environ.pop("API_HOST", None)
+            main_module.os.environ.pop("API_PORT", None)
+            host, port = resolve_server_bind()
+        finally:
+            main_module.os.environ.clear()
+            main_module.os.environ.update(original_environ)
+
+        self.assertEqual(host, "0.0.0.0")
+        self.assertEqual(port, 8000)
+
+    def test_resolve_server_bind_reads_env(self) -> None:
+        import api.main as main_module
+
+        original_environ = dict(main_module.os.environ)
+        try:
+            main_module.os.environ["API_HOST"] = "127.0.0.1"
+            main_module.os.environ["API_PORT"] = "18123"
+            host, port = resolve_server_bind()
+        finally:
+            main_module.os.environ.clear()
+            main_module.os.environ.update(original_environ)
+
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, 18123)
+
+    def test_resolve_server_bind_invalid_port_type(self) -> None:
+        import api.main as main_module
+
+        original_environ = dict(main_module.os.environ)
+        try:
+            main_module.os.environ["API_PORT"] = "invalid"
+            with self.assertRaises(RuntimeError):
+                resolve_server_bind()
+        finally:
+            main_module.os.environ.clear()
+            main_module.os.environ.update(original_environ)
+
+    def test_resolve_server_bind_invalid_port_range(self) -> None:
+        import api.main as main_module
+
+        original_environ = dict(main_module.os.environ)
+        try:
+            main_module.os.environ["API_PORT"] = "70000"
+            with self.assertRaises(RuntimeError):
+                resolve_server_bind()
+        finally:
+            main_module.os.environ.clear()
+            main_module.os.environ.update(original_environ)
 
 
 if __name__ == "__main__":

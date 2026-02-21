@@ -24,6 +24,9 @@ METRICS: dict[str, tuple[str, str]] = {
     "wind_speed": ("Скорость ветра", "m/s"),
     "cloudiness": ("Облачность", "%"),
     "ndvi": ("NDVI", "index"),
+    "ndre": ("NDRE", "index"),
+    "ndmi": ("NDMI", "index"),
+    "cloud_mask": ("Маска облачности", "%"),
 }
 
 
@@ -165,6 +168,14 @@ def _metric_value(source: str, metric: str, ts: datetime) -> float:
     if metric == "ndvi":
         base = 0.35 + (day % 10) * 0.015 * factor
         return round(min(0.95, base), 4)
+    if metric == "ndre":
+        base = 0.28 + (day % 8) * 0.012 * factor
+        return round(min(0.92, base), 4)
+    if metric == "ndmi":
+        base = 0.22 + (hour % 10) * 0.02 * factor
+        return round(min(0.88, base), 4)
+    if metric == "cloud_mask":
+        return round(min(100.0, 15.0 + (hour % 12) * 6.0 * factor), 4)
     raise Stage3Error(f"Неизвестная метрика: {metric}")
 
 
@@ -177,6 +188,8 @@ def _quality_flags(source: str, metric: str, ts: datetime) -> list[str]:
         flags.append("simulated")
     if metric == "wind_speed" and ts.hour % 13 == 0:
         flags.append("low_confidence")
+    if metric == "cloud_mask" and ts.hour % 7 == 0:
+        flags.append("cloud_mask_interpolated")
 
     return flags
 

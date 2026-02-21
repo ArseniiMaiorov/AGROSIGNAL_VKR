@@ -17,7 +17,7 @@ def _collect_source_files() -> list[Path]:
 
 def _executable_lines(path: Path) -> set[int]:
     lines = trace._find_executable_linenos(str(path))  # type: ignore[attr-defined]
-    return {line for line in lines if line > 0}
+    return {int(line) for line in lines if isinstance(line, int) and line > 0}
 
 
 def _executed_lines(counts: dict[tuple[str, int], int], path: Path) -> set[int]:

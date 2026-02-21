@@ -83,7 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     ensure_admin = sub.add_parser("ensure-admin")
     ensure_admin.add_argument("--email", required=True)
 
-    sub.add_parser("proxy-get")
+    proxy_get = sub.add_parser("proxy-get")
+    proxy_get.add_argument("--admin-email", required=True)
 
     proxy_set = sub.add_parser("proxy-set")
     proxy_set.add_argument("--admin-email", required=True)
@@ -115,10 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
     degradation = sub.add_parser("degradation-status")
     degradation.add_argument("--provider", required=True)
 
-    sub.add_parser("metrics")
+    metrics = sub.add_parser("metrics")
+    metrics.add_argument("--admin-email", required=True)
 
     request_log = sub.add_parser("request-log")
     request_log.add_argument("--request-id", required=True)
+    request_log.add_argument("--admin-email", required=True)
 
     return parser
 
@@ -137,11 +140,11 @@ def main() -> int:
             return 0
 
         if args.command == "proxy-get":
-            _print_json(get_proxy_settings(db))
+            _print_json(get_proxy_settings(db, admin_email=args.admin_email))
             return 0
 
         if args.command == "proxy-set":
-            current = get_proxy_settings(db)
+            current = get_proxy_settings(db, admin_email=args.admin_email)
             merged = _resolve_proxy_update(args, current)
             _print_json(
                 set_proxy_settings(
@@ -191,11 +194,11 @@ def main() -> int:
             return 0
 
         if args.command == "metrics":
-            _print_json(get_proxy_metrics(db))
+            _print_json(get_proxy_metrics(db, admin_email=args.admin_email))
             return 0
 
         if args.command == "request-log":
-            _print_json(get_request_log(db, request_id=args.request_id))
+            _print_json(get_request_log(db, request_id=args.request_id, admin_email=args.admin_email))
             return 0
 
         raise Stage4Error("Неизвестная команда")

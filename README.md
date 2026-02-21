@@ -20,6 +20,7 @@ make print-port
 ```
 
 `make up` автоматически выбирает свободный порт API, если целевой порт занят.
+Если в локальной среде недоступен Docker published port, `make up` автоматически переключает API в локальный режим (`API_MODE=local`) и сохраняет порт в `backend/.api_port`.
 
 ## Базовые проверки качества
 ```bash
@@ -29,6 +30,7 @@ make migrate
 make test-stage2
 make test-stage3
 make test-stage4
+make quality
 ```
 
 ## Режимы этапа 3
@@ -41,16 +43,23 @@ make stage3-cycle
 ```bash
 cd backend
 python3 scripts/stage4_cli.py ensure-admin --email admin.stage4@zemledar.local
-python3 scripts/stage4_cli.py proxy-get
+python3 scripts/stage4_cli.py proxy-get --admin-email admin.stage4@zemledar.local
 python3 scripts/stage4_cli.py health-check \
   --admin-email admin.stage4@zemledar.local \
   --provider Copernicus \
   --module providers/copernicus/sync \
   --source-url https://example.org/
+python3 scripts/stage4_cli.py metrics --admin-email admin.stage4@zemledar.local
+```
+
+Упрощённый вызов из корня репозитория:
+```bash
+./stage4_cli.py proxy-get --admin-email admin.stage4@zemledar.local
 ```
 
 Секреты proxy (логин/пароль/token) хранятся в переменных окружения или secret-store и не сохраняются в БД.
 Прокси применяется только к outbound-запросам модулей `providers/copernicus/*`, `providers/nasa/*`, `datasets/download/*`.
+Для операций чтения/изменения proxy-настроек, журналов и метрик требуется роль `admin`.
 
 ## Полезные команды
 ```bash
@@ -61,9 +70,6 @@ make down
 
 ## Проверка API
 ```bash
-cd backend
-docker compose -f docker-compose.yml exec -T api python - <<'PY'
-import urllib.request
-print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read().decode())
-PY
+API_PORT=$(cat backend/.api_port)
+curl -sS "http://127.0.0.1:${API_PORT}/health"
 ```

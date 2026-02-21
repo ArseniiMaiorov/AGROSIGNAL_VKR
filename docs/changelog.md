@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1] - 2026-02-21
+### Изменено
+- Этап 3: расширен набор метрик контракта (`NDRE`, `NDMI`, `cloud_mask`) и добавлена миграция `006_stage3_extend_satellite_metrics.sql`.
+- Добавлен фоновый планировщик `stage_scheduler.py` (автоматический цикл sync/export/ttl по расписанию).
+- Добавлен единый quality-gate `make quality` (unit + миграции + stage2/stage3/stage4).
+- Этап 4: усилен RBAC для чтения proxy-настроек/метрик/журналов (`admin`).
+- Этап 4: добавлена санитизация ошибок для исключения утечки секретов в status/log.
+- Добавлен wrapper `stage4_cli.py` в корне репозитория и make-команды для stage4 CLI.
+- `make up` получил автоматический fallback в локальный API-режим при недоступном Docker published port.
+
 ## [0.4.0] - 2026-02-21
 ### Добавлено
 - Этап 4: proxy-контур загрузчиков датасетов Copernicus/NASA/Mock.

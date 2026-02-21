@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import socket
 import ssl
 import time
@@ -118,6 +119,16 @@ def _sanitize_proxy_endpoint(proxy_endpoint: str | None) -> str | None:
     netloc = f"{host}{port}"
 
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _sanitize_text(value: str) -> str:
+    if not value:
+        return value
+
+    sanitized = value
+    sanitized = re.sub(r"(?i)(https?://)([^/@:\s]+):([^/@\s]+)@", r"\1***:***@", sanitized)
+    sanitized = re.sub(r"(?i)(password|passwd|token|secret)=([^&\s]+)", r"\1=***", sanitized)
+    return sanitized
 
 
 def _proxy_endpoint_with_credentials(proxy_endpoint: str | None) -> str | None:
@@ -365,12 +376,10 @@ def set_proxy_settings(
         """
     )
 
-    return get_proxy_settings(db)
+    return _format_proxy_settings(_load_proxy_settings(db))
 
 
-def get_proxy_settings(db: DbClient) -> dict[str, Any]:
-    settings = _load_proxy_settings(db)
-
+def _format_proxy_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return {
         "proxy_enabled": bool(settings["proxy_enabled"]),
         "proxy_mode": settings["proxy_mode"],
@@ -392,6 +401,11 @@ def get_proxy_settings(db: DbClient) -> dict[str, Any]:
         "updated_at": settings.get("updated_at"),
         "updated_by": settings.get("updated_by"),
     }
+
+
+def get_proxy_settings(db: DbClient, *, admin_email: str) -> dict[str, Any]:
+    _ensure_admin(db, admin_email)
+    return _format_proxy_settings(_load_proxy_settings(db))
 
 
 def resolve_proxy_usage(
@@ -630,7 +644,7 @@ def perform_provider_request(
             bytes_downloaded = len(body)
         except Exception as exc:  # noqa: BLE001
             error_class = _classify_exception(exc)
-            error_message = str(exc)
+            error_message = _sanitize_text(str(exc))
 
         duration_ms = int((time.perf_counter() - started) * 1000)
 
@@ -719,7 +733,7 @@ def _check_proxy_connectivity(settings: dict[str, Any], timeout_seconds: int) ->
             status="FAIL",
             latency_ms=latency_ms,
             error_class=_classify_exception(exc),
-            reason=str(exc),
+            reason=_sanitize_text(str(exc)),
         )
 
 
@@ -849,7 +863,8 @@ def get_degradation_status(db: DbClient, provider: str) -> dict[str, Any]:
     return payload
 
 
-def get_proxy_metrics(db: DbClient) -> dict[str, Any]:
+def get_proxy_metrics(db: DbClient, *, admin_email: str) -> dict[str, Any]:
+    _ensure_admin(db, admin_email)
     rows = db.query_json(
         """
         SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)
@@ -891,7 +906,8 @@ def get_proxy_metrics(db: DbClient) -> dict[str, Any]:
     }
 
 
-def get_request_log(db: DbClient, request_id: str) -> dict[str, Any]:
+def get_request_log(db: DbClient, request_id: str, *, admin_email: str) -> dict[str, Any]:
+    _ensure_admin(db, admin_email)
     payload = db.query_json(
         f"""
         SELECT COALESCE((
