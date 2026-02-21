@@ -1,0 +1,144 @@
+{
+  "source": "Mock",
+  "from": "2026-01-10T00:00:00Z",
+  "to": "2026-01-11T18:00:00Z",
+  "tbase_c": 10,
+  "records": [
+    {
+      "timestamp": "2026-01-10T00:00:00Z",
+      "metrics": {
+        "temperature": 12.0,
+        "humidity_rh": 70.0,
+        "wind_speed": 2.0,
+        "radiation": 0.0,
+        "precipitation": 1.0,
+        "soil_moisture": 38.0,
+        "ndvi": 0.42,
+        "ndre": 0.36,
+        "ndmi": 0.31,
+        "cloudiness": 20.0,
+        "cloud_total": 20.0,
+        "cloud_mask": 15.0
+      }
+    },
+    {
+      "timestamp": "2026-01-10T06:00:00Z",
+      "metrics": {
+        "temperature": 16.0,
+        "humidity_rh": 60.0,
+        "wind_speed": 3.0,
+        "radiation": 200.0,
+        "precipitation": 0.5,
+        "soil_moisture": 37.0,
+        "ndvi": 0.43,
+        "ndre": 0.37,
+        "ndmi": 0.32,
+        "cloudiness": 35.0,
+        "cloud_total": 35.0,
+        "cloud_mask": 25.0
+      }
+    },
+    {
+      "timestamp": "2026-01-10T12:00:00Z",
+      "metrics": {
+        "temperature": 22.0,
+        "humidity_rh": 45.0,
+        "wind_speed": 4.0,
+        "radiation": 600.0,
+        "precipitation": 0.2,
+        "soil_moisture": 35.0,
+        "ndvi": 0.46,
+        "ndre": 0.39,
+        "ndmi": 0.35,
+        "cloudiness": 50.0,
+        "cloud_total": 50.0,
+        "cloud_mask": 45.0
+      }
+    },
+    {
+      "timestamp": "2026-01-10T18:00:00Z",
+      "metrics": {
+        "temperature": 18.0,
+        "humidity_rh": 55.0,
+        "wind_speed": 3.0,
+        "radiation": 150.0,
+        "precipitation": 0.0,
+        "soil_moisture": 36.0,
+        "ndvi": 0.45,
+        "ndre": 0.38,
+        "ndmi": 0.34,
+        "cloudiness": 45.0,
+        "cloud_total": 45.0,
+        "cloud_mask": 40.0
+      }
+    },
+    {
+      "timestamp": "2026-01-11T00:00:00Z",
+      "metrics": {
+        "temperature": 11.0,
+        "humidity_rh": 75.0,
+        "wind_speed": 2.5,
+        "radiation": 0.0,
+        "precipitation": 1.5,
+        "soil_moisture": 40.0,
+        "ndvi": 0.44,
+        "ndre": 0.37,
+        "ndmi": 0.33,
+        "cloudiness": 25.0,
+        "cloud_total": 25.0,
+        "cloud_mask": 20.0
+      }
+    },
+    {
+      "timestamp": "2026-01-11T06:00:00Z",
+      "metrics": {
+        "temperature": 15.0,
+        "humidity_rh": 65.0,
+        "wind_speed": 3.5,
+        "radiation": 220.0,
+        "precipitation": 0.7,
+        "soil_moisture": 39.0,
+        "ndvi": 0.46,
+        "ndre": 0.39,
+        "ndmi": 0.34,
+        "cloudiness": 40.0,
+        "cloud_total": 40.0,
+        "cloud_mask": 30.0
+      }
+    },
+    {
+      "timestamp": "2026-01-11T12:00:00Z",
+      "metrics": {
+        "temperature": 20.0,
+        "humidity_rh": 50.0,
+        "wind_speed": 4.5,
+        "radiation": 650.0,
+        "precipitation": 0.1,
+        "soil_moisture": 37.0,
+        "ndvi": 0.49,
+        "ndre": 0.41,
+        "ndmi": 0.37,
+        "cloudiness": 55.0,
+        "cloud_total": 55.0,
+        "cloud_mask": 50.0
+      }
+    },
+    {
+      "timestamp": "2026-01-11T18:00:00Z",
+      "metrics": {
+        "temperature": 17.0,
+        "humidity_rh": 60.0,
+        "wind_speed": 3.0,
+        "radiation": 180.0,
+        "precipitation": 0.0,
+        "soil_moisture": 38.0,
+        "ndvi": 0.48,
+        "ndre": 0.40,
+        "ndmi": 0.36,
+        "cloudiness": 50.0,
+        "cloud_total": 50.0,
+        "cloud_mask": 45.0
+      }
+    }
+  ]
+}

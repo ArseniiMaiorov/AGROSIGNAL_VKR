@@ -1,0 +1,11 @@
+{
+  "algorithm_id": "water_deficit",
+  "values": [
+    {
+      "et0_sum_mm": 10.560644,
+      "precip_sum_mm": 4.0,
+      "water_deficit_mm": 6.560644
+    }
+  ],
+  "tolerance": 0.001
+}

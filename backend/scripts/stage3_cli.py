@@ -21,8 +21,13 @@ VALID_EXPORT_FORMATS = {"json", "csv"}
 METRICS: dict[str, tuple[str, str]] = {
     "precipitation": ("Осадки", "mm"),
     "temperature": ("Температура", "C"),
+    "humidity_rh": ("Относительная влажность", "%"),
     "wind_speed": ("Скорость ветра", "m/s"),
     "cloudiness": ("Облачность", "%"),
+    "cloud_total": ("Общая облачность", "%"),
+    "pressure_msl": ("Давление на уровне моря", "hPa"),
+    "radiation": ("Солнечная радиация", "W/m2"),
+    "soil_moisture": ("Влажность почвы", "%"),
     "ndvi": ("NDVI", "index"),
     "ndre": ("NDRE", "index"),
     "ndmi": ("NDMI", "index"),
@@ -161,10 +166,21 @@ def _metric_value(source: str, metric: str, ts: datetime) -> float:
         return round(max(0.0, (hour % 6) * 0.4 * factor + (day % 3) * 0.2), 4)
     if metric == "temperature":
         return round(8.0 + (hour % 24) * 0.6 * factor + (day % 5) * 0.3, 4)
+    if metric == "humidity_rh":
+        return round(max(20.0, min(100.0, 68.0 + (day % 6) * 2.8 - (hour % 24) * 0.7 * factor)), 4)
     if metric == "wind_speed":
         return round(1.5 + (hour % 8) * 0.5 * factor, 4)
     if metric == "cloudiness":
         return round(min(100.0, 25.0 + (hour % 12) * 6.5 * factor), 4)
+    if metric == "cloud_total":
+        return round(min(100.0, 20.0 + (hour % 12) * 6.2 * factor), 4)
+    if metric == "pressure_msl":
+        return round(1008.0 + ((hour % 24) - 12) * 0.9 + (day % 4) * 0.4 * factor, 4)
+    if metric == "radiation":
+        daytime = max(0.0, 1.0 - abs(hour - 12) / 8.0)
+        return round(50.0 + daytime * 850.0 * factor, 4)
+    if metric == "soil_moisture":
+        return round(max(5.0, min(95.0, 34.0 + (day % 7) * 2.3 * factor - (hour % 12) * 0.35)), 4)
     if metric == "ndvi":
         base = 0.35 + (day % 10) * 0.015 * factor
         return round(min(0.95, base), 4)
@@ -188,6 +204,8 @@ def _quality_flags(source: str, metric: str, ts: datetime) -> list[str]:
         flags.append("simulated")
     if metric == "wind_speed" and ts.hour % 13 == 0:
         flags.append("low_confidence")
+    if metric in {"cloudiness", "cloud_total"} and ts.hour % 9 == 0:
+        flags.append("low_quality")
     if metric == "cloud_mask" and ts.hour % 7 == 0:
         flags.append("cloud_mask_interpolated")
 

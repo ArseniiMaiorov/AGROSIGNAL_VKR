@@ -46,9 +46,19 @@ from stage4_proxy import get_degradation_status
 
 EXPORTS_DIR = ROOT / "exports"
 API_VERSION = "v1"
-WEATHER_METRICS = {"precipitation", "temperature", "wind_speed", "cloudiness"}
+WEATHER_METRICS = {
+    "precipitation",
+    "temperature",
+    "humidity_rh",
+    "wind_speed",
+    "cloudiness",
+    "cloud_total",
+    "pressure_msl",
+    "radiation",
+}
+SOIL_METRICS = {"soil_moisture"}
 SATELLITE_METRICS = {"ndvi", "ndre", "ndmi"}
-SATELLITE_QUALITY_METRICS = {"cloudiness", "cloud_mask"}
+SATELLITE_QUALITY_METRICS = {"cloudiness", "cloud_total", "cloud_mask"}
 ROLE_ADMIN = "admin"
 ROLE_MANAGER = "manager"
 ROLE_AGRONOMIST = "agronomist"
@@ -66,6 +76,7 @@ SOURCE_ALIASES = {
     "mock": "Mock",
 }
 LAYER_METRIC_MAP = {
+    # Stage5 legacy aliases
     "weather.wind_vector_10m": ("wind_speed",),
     "weather.temperature_2m": ("temperature",),
     "weather.precipitation": ("precipitation",),
@@ -73,8 +84,42 @@ LAYER_METRIC_MAP = {
     "satellite.ndre": ("ndre",),
     "satellite.ndmi": ("ndmi",),
     "satellite.cloud_mask": ("cloud_mask", "cloudiness"),
+    # Stage6 canonical layers
+    "weather.temp_2m": ("temperature",),
+    "weather.humidity_rh": ("humidity_rh",),
+    "weather.precip_sum": ("precipitation",),
+    "weather.cloud_total": ("cloud_total", "cloudiness"),
+    "weather.pressure_msl": ("pressure_msl",),
+    "weather.radiation": ("radiation",),
+    "weather.wind_speed_10m": ("wind_speed",),
+    "weather.wind_streamlines": ("wind_speed",),
+    "weather.vorticity_index": ("wind_speed",),
+    "soil.moisture": ("soil_moisture",),
+    "soil.moisture_anomaly": ("soil_moisture",),
+    "soil.trafficability_risk": ("soil_moisture", "precipitation"),
+    "sat.ndvi": ("ndvi",),
+    "sat.ndre": ("ndre",),
+    "sat.ndmi": ("ndmi",),
+    "sat.scene_quality": ("cloud_mask", "cloud_total", "cloudiness"),
+    "sat.cloud_mask": ("cloud_mask", "cloud_total", "cloudiness"),
+    "sat.season_curve": ("ndvi",),
+    "sat.growth_rate": ("ndvi",),
+    "sat.field_uniformity_cv": ("ndvi",),
+    "sat.anomaly_vs_baseline": ("ndvi",),
 }
 SCALAR_AGGREGATIONS = {"mean", "sum", "min", "max", "p10", "p90", "median"}
+EXPECTED_UNITS: dict[str, str] = {
+    "temperature": "C",
+    "humidity_rh": "%",
+    "wind_speed": "m/s",
+    "precipitation": "mm",
+    "cloudiness": "%",
+    "cloud_total": "%",
+    "pressure_msl": "hPa",
+    "radiation": "W/m2",
+    "soil_moisture": "%",
+}
+ALGORITHM_VERSION = "algorithms.v1"
 
 
 class ApiError(RuntimeError):
@@ -400,6 +445,18 @@ class Stage5ApiApp:
                 error_code="NO_DATA" if no_data else None,
             )
 
+        layer_id_for_field = self._match_text(path, r"^/api/v1/layers/([a-zA-Z0-9_.-]+)/field$")
+        if layer_id_for_field is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data, no_data = self._get_layer_field(db, user, layer_id_for_field, query)
+            return self._success(
+                data,
+                request_id=request_id,
+                user_id=user.user_id,
+                meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
+                error_code="NO_DATA" if no_data else None,
+            )
+
         layer_tile_match = re.fullmatch(r"^/api/v1/layers/([a-zA-Z0-9_.-]+)/tiles/(\d+)/(\d+)/(\d+)$", path)
         if layer_tile_match is not None and method == "GET":
             self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
@@ -445,6 +502,30 @@ class Stage5ApiApp:
                 meta_extra=self._no_data_meta(no_data, "Нет данных за выбранный период"),
                 error_code="NO_DATA" if no_data else None,
             )
+
+        field_algo_id = self._match_id(path, r"^/api/v1/fields/(\d+)/algorithms/gdd$")
+        if field_algo_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_algorithm_gdd(db, user, field_algo_id, query, request_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        field_algo_id = self._match_id(path, r"^/api/v1/fields/(\d+)/algorithms/vpd$")
+        if field_algo_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_algorithm_vpd(db, user, field_algo_id, query, request_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        field_algo_id = self._match_id(path, r"^/api/v1/fields/(\d+)/algorithms/et0$")
+        if field_algo_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_algorithm_et0(db, user, field_algo_id, query, request_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
+
+        field_algo_id = self._match_id(path, r"^/api/v1/fields/(\d+)/algorithms/water-deficit$")
+        if field_algo_id is not None and method == "GET":
+            self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
+            data = self._get_algorithm_water_deficit(db, user, field_algo_id, query, request_id)
+            return self._success(data, request_id=request_id, user_id=user.user_id)
 
         if path == "/api/v1/stream" and method == "GET":
             self._require_roles(user, {ROLE_ADMIN, ROLE_MANAGER, ROLE_AGRONOMIST, ROLE_VIEWER})
@@ -1787,6 +1868,7 @@ class Stage5ApiApp:
 
         coverage = self._coverage_percent(range_start, range_end, len(records), len(WEATHER_METRICS))
         last_sync = report.get("last_sync", {}).get("last_success_at") or report.get("last_sync", {}).get("last_sync_at")
+        quality_flags_summary = self._quality_flags_summary(records)
 
         result = {
             "field_id": field_id,
@@ -1800,6 +1882,7 @@ class Stage5ApiApp:
             "meta": {
                 "last_sync_at": last_sync,
                 "data_coverage": coverage,
+                "quality_flags": quality_flags_summary,
                 "contract_version": CONTRACT_VERSION,
             },
         }
@@ -1883,8 +1966,11 @@ class Stage5ApiApp:
             flags = [str(flag) for flag in row.get("quality_flags", [])]
             unreliable = any(flag in {"cloudy", "low_confidence", "cloud_mask_interpolated"} for flag in flags)
             row["quality_status"] = "недостоверно" if unreliable else "достоверно"
+            row["quality_level"] = "LOW_QUALITY" if unreliable else "OK"
 
         last_sync = report.get("last_sync", {}).get("last_success_at") or report.get("last_sync", {}).get("last_sync_at")
+        quality_flags_summary = self._quality_flags_summary(records)
+        coverage = self._coverage_percent(range_start, range_end, len(records), 1)
 
         result = {
             "field_id": field_id,
@@ -1895,6 +1981,8 @@ class Stage5ApiApp:
             "values": records,
             "meta": {
                 "last_sync_at": last_sync,
+                "data_coverage": coverage,
+                "quality_flags": quality_flags_summary,
                 "contract_version": CONTRACT_VERSION,
             },
         }
@@ -1924,11 +2012,12 @@ class Stage5ApiApp:
                     MAX(value) FILTER (WHERE metric_code = 'ndre') AS ndre,
                     MAX(value) FILTER (WHERE metric_code = 'ndmi') AS ndmi,
                     MAX(value) FILTER (WHERE metric_code = 'cloudiness') AS cloudiness,
+                    MAX(value) FILTER (WHERE metric_code = 'cloud_total') AS cloud_total,
                     MAX(value) FILTER (WHERE metric_code = 'cloud_mask') AS cloud_mask,
                     source,
                     CASE
                         WHEN COALESCE(MAX(value) FILTER (WHERE metric_code = 'cloud_mask'), 0) >= 60 THEN 'недостоверно'
-                        WHEN COALESCE(MAX(value) FILTER (WHERE metric_code = 'cloudiness'), 0) >= 70 THEN 'недостоверно'
+                        WHEN COALESCE(MAX(value) FILTER (WHERE metric_code = 'cloud_total'), MAX(value) FILTER (WHERE metric_code = 'cloudiness'), 0) >= 70 THEN 'недостоверно'
                         ELSE 'достоверно'
                     END AS quality_status
                 FROM provider_observations
@@ -1936,7 +2025,7 @@ class Stage5ApiApp:
                   AND source = {_sql_quote(source)}
                   AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
                                       AND {_sql_quote(_iso_utc(range_end))}::timestamptz
-                  AND metric_code IN ('ndvi', 'ndre', 'ndmi', 'cloudiness', 'cloud_mask')
+                  AND metric_code IN ('ndvi', 'ndre', 'ndmi', 'cloudiness', 'cloud_total', 'cloud_mask')
                 GROUP BY observed_at, source
             ) x;
             """
@@ -1944,6 +2033,7 @@ class Stage5ApiApp:
         assert isinstance(payload, list)
 
         last_sync = get_sync_status(db, source).get("last_success_at")
+        coverage = self._coverage_percent(range_start, range_end, len(payload), 1)
         result = {
             "field_id": field_id,
             "source": source,
@@ -1952,6 +2042,7 @@ class Stage5ApiApp:
             "scenes": payload,
             "meta": {
                 "last_sync_at": last_sync,
+                "data_coverage": coverage,
                 "contract_version": CONTRACT_VERSION,
             },
         }
@@ -1984,22 +2075,32 @@ class Stage5ApiApp:
                     quality_flags,
                     CASE
                         WHEN metric_code = 'cloud_mask' AND value >= 60 THEN 'недостоверно'
-                        WHEN metric_code = 'cloudiness' AND value >= 70 THEN 'недостоверно'
+                        WHEN metric_code IN ('cloudiness', 'cloud_total') AND value >= 70 THEN 'недостоверно'
                         WHEN quality_flags::text ILIKE '%cloudy%' THEN 'недостоверно'
+                        WHEN quality_flags::text ILIKE '%low_quality%' THEN 'недостоверно'
                         ELSE 'достоверно'
-                    END AS quality_status
+                    END AS quality_status,
+                    CASE
+                        WHEN metric_code = 'cloud_mask' AND value >= 60 THEN 'LOW_QUALITY'
+                        WHEN metric_code IN ('cloudiness', 'cloud_total') AND value >= 70 THEN 'LOW_QUALITY'
+                        WHEN quality_flags::text ILIKE '%cloudy%' THEN 'LOW_QUALITY'
+                        WHEN quality_flags::text ILIKE '%low_quality%' THEN 'LOW_QUALITY'
+                        ELSE 'OK'
+                    END AS quality_level
                 FROM provider_observations
                 WHERE field_id = {field_id}
                   AND source = {_sql_quote(source)}
                   AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
                                       AND {_sql_quote(_iso_utc(range_end))}::timestamptz
-                  AND metric_code IN ('cloudiness', 'cloud_mask')
+                  AND metric_code IN ('cloudiness', 'cloud_total', 'cloud_mask')
             ) x;
             """
         )
         assert isinstance(payload, list)
 
         last_sync = get_sync_status(db, source).get("last_success_at")
+        quality_flags_summary = self._quality_flags_summary(payload)
+        coverage = self._coverage_percent(range_start, range_end, len(payload), len(SATELLITE_QUALITY_METRICS))
         result = {
             "field_id": field_id,
             "source": source,
@@ -2008,6 +2109,8 @@ class Stage5ApiApp:
             "quality": payload,
             "meta": {
                 "last_sync_at": last_sync,
+                "data_coverage": coverage,
+                "quality_flags": quality_flags_summary,
                 "contract_version": CONTRACT_VERSION,
             },
         }
@@ -2182,7 +2285,7 @@ class Stage5ApiApp:
         )
         no_data = len(rows) == 0
 
-        cell_size_m = self._select_cell_size(layer, zoom)
+        spatial_mode, cell_size_m = self._select_spatial_mode(layer, zoom, prefer="grid")
         values_by_metric: dict[str, list[float]] = {}
         for row in rows:
             metric = str(row.get("metric") or "")
@@ -2192,16 +2295,18 @@ class Stage5ApiApp:
             if value is not None:
                 values_by_metric[metric].append(float(value))
 
-        base_metric = LAYER_METRIC_MAP[layer_id][0]
-        base_values = values_by_metric.get(base_metric, [])
-        aggregated_value = self._aggregate_values(base_values, agg) if base_values else 0.0
+        aggregated_by_metric: dict[str, float] = {}
+        for metric_name, metric_values in values_by_metric.items():
+            if metric_values:
+                aggregated_by_metric[metric_name] = self._aggregate_values(metric_values, agg)
 
         cells: list[dict[str, Any]] = []
         if not no_data:
             def build_payload(ix: int, iy: int, center_lon: float, center_lat: float) -> dict[str, Any]:
                 jitter = ((ix * 92821 + iy * 68917 + len(layer_id)) % 100) / 1000.0
-                if layer.get("value_type") == "vector":
-                    speed = max(0.0, aggregated_value * (0.95 + jitter))
+                if str(layer.get("value_type")) == "vector":
+                    base_speed = float(aggregated_by_metric.get("wind_speed") or 0.0)
+                    speed = max(0.0, base_speed * (0.95 + jitter))
                     direction = float((ix * 31 + iy * 17 + 180) % 360)
                     rad = math.radians(direction)
                     u = round(speed * math.sin(rad), 4)
@@ -2214,13 +2319,15 @@ class Stage5ApiApp:
                         "units": layer.get("units"),
                     }
 
-                value = max(0.0, aggregated_value * (0.95 + jitter))
+                value = self._layer_scalar_value(layer_id, aggregated_by_metric, ix, iy)
+                value = max(0.0, value * (0.95 + jitter))
                 return {"value": round(value, 4), "units": layer.get("units")}
 
             cells = self._build_grid_cells(bbox, cell_size_m, build_payload)
 
         quality_summary = self._quality_flags_summary(rows)
         last_sync_at = self._source_last_sync(db, source)
+        coverage = self._coverage_percent(range_start, range_end, len(rows), len(LAYER_METRIC_MAP.get(layer_id, ("x",))))
         data = {
             "layer_id": layer_id,
             "source": source,
@@ -2235,17 +2342,101 @@ class Stage5ApiApp:
             },
             "grid": {
                 "cell_size_m": cell_size_m,
-                "coverage": 0 if no_data else 100,
+                "coverage": 0 if no_data else coverage,
                 "cells": cells,
             },
             "meta": {
                 "source": source,
                 "last_sync_at": last_sync_at,
                 "quality_flags_summary": quality_summary,
+                "spatial_mode": spatial_mode,
+                "zoom_detail": {
+                    "zoom": zoom,
+                    "mode": spatial_mode,
+                    "cell_size_m": cell_size_m,
+                },
                 "contract_version": CONTRACT_VERSION,
             },
         }
         return data, no_data
+
+    def _get_layer_field(
+        self,
+        db: DbClient,
+        user: UserContext,
+        layer_id: str,
+        query: dict[str, list[str]],
+    ) -> tuple[dict[str, Any], bool]:
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        layer = self._load_layer(db, layer_id, source)
+        field_id = self._int_value(self._query_str(query, "field_id", required=True), "field_id", min_value=1)
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+
+        range_start, range_end = self._resolve_time_range(query)
+        granularity = self._query_str(query, "granularity", required=False) or str(layer.get("default_granularity") or "day")
+        allowed_granularities = {str(item) for item in (layer.get("time_available") or [])}
+        if granularity not in allowed_granularities:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: granularity", status=422)
+
+        agg = self._query_str(query, "agg", required=False) or "mean"
+        if agg not in SCALAR_AGGREGATIONS:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: agg", status=422)
+
+        rows = self._load_layer_points(
+            db,
+            source=source,
+            layer_id=layer_id,
+            range_start=range_start,
+            range_end=range_end,
+            field_id=field_id,
+            enterprise_id=(None if user.role_code == ROLE_ADMIN else user.enterprise_id),
+        )
+        no_data = len(rows) == 0
+
+        values_by_metric: dict[str, list[float]] = {}
+        for row in rows:
+            metric = str(row.get("metric") or "")
+            value = row.get("value")
+            if metric not in values_by_metric:
+                values_by_metric[metric] = []
+            if value is not None:
+                values_by_metric[metric].append(float(value))
+
+        aggregated_by_metric: dict[str, float] = {}
+        for metric_name, metric_values in values_by_metric.items():
+            if metric_values:
+                aggregated_by_metric[metric_name] = self._aggregate_values(metric_values, agg)
+
+        value = 0.0 if no_data else self._layer_scalar_value(layer_id, aggregated_by_metric, 0, 0)
+        quality_summary = self._quality_flags_summary(rows)
+        coverage = self._coverage_percent(range_start, range_end, len(rows), len(LAYER_METRIC_MAP.get(layer_id, ("x",))))
+        last_sync_at = self._source_last_sync(db, source)
+
+        return (
+            {
+                "layer_id": layer_id,
+                "field_id": field_id,
+                "source": source,
+                "granularity": granularity,
+                "agg": agg,
+                "time": {
+                    "from": _iso_utc(range_start),
+                    "to": _iso_utc(range_end),
+                },
+                "value": round(float(value), 4),
+                "units": layer.get("units"),
+                "meta": {
+                    "source": source,
+                    "last_sync_at": last_sync_at,
+                    "data_coverage": 0.0 if no_data else coverage,
+                    "quality_flags_summary": quality_summary,
+                    "spatial_mode": "field",
+                    "contract_version": CONTRACT_VERSION,
+                },
+            },
+            no_data,
+        )
 
     def _get_layer_tile(
         self,
@@ -2374,12 +2565,27 @@ class Stage5ApiApp:
             agg="mean",
         )
 
+        quality_labels = [str(item.get("quality", "")) for item in values if isinstance(item, dict)]
+        data_quality = "low" if "low" in quality_labels else "good"
+
+        last_sync_at = self._source_last_sync(db, source)
+        freshness_note = ""
+        if last_sync_at:
+            try:
+                sync_dt = self._parse_datetime(last_sync_at)
+                stale_hours = (datetime.now(timezone.utc) - sync_dt).total_seconds() / 3600.0
+                if stale_hours > 12:
+                    data_quality = "low"
+                    freshness_note = f" Данные устарели ({int(stale_hours)} ч)."
+            except Exception:
+                freshness_note = ""
+
         if wind_avg_6h is not None and wind_avg_6h > 8:
-            mini_reco = "Ветер высокий, опрыскивание лучше отложить."
+            mini_reco = f"Ветер {wind_avg_6h:.1f} м/с: опрыскивание лучше отложить.{freshness_note}".strip()
         elif precipitation_24h is not None and precipitation_24h > 15:
-            mini_reco = "Ожидаются значимые осадки, проверьте план полевых работ."
+            mini_reco = f"Осадки за 24ч: {precipitation_24h:.1f} мм, проверьте план полевых работ.{freshness_note}".strip()
         else:
-            mini_reco = "Критичных отклонений нет, продолжайте мониторинг слоя."
+            mini_reco = f"Критичных отклонений нет, продолжайте мониторинг слоя.{freshness_note}".strip()
 
         no_data = len(values) == 0
         data = {
@@ -2391,8 +2597,15 @@ class Stage5ApiApp:
                 "wind_avg_6h_ms": round(float(wind_avg_6h or 0.0), 4),
             },
             "mini_reco": mini_reco,
+            "mini_reco_context": {
+                "data_quality": data_quality,
+                "trigger_factors": {
+                    "wind_avg_6h_ms": round(float(wind_avg_6h or 0.0), 4),
+                    "precipitation_sum_24h_mm": round(float(precipitation_24h or 0.0), 4),
+                },
+            },
             "meta": {
-                "last_sync_at": self._source_last_sync(db, source),
+                "last_sync_at": last_sync_at,
                 "source": source,
             },
         }
@@ -2444,7 +2657,7 @@ class Stage5ApiApp:
             agg="mean",
         ) or 0.4
 
-        side = 2 if zoom <= 9 else (3 if zoom <= 12 else 4)
+        side = 2 if zoom <= 9 else (3 if zoom <= 12 else (4 if zoom <= 14 else 5))
         min_lon = float(bbox["min_lon"])
         min_lat = float(bbox["min_lat"])
         max_lon = float(bbox["max_lon"])
@@ -2559,6 +2772,14 @@ class Stage5ApiApp:
             "zoom": zoom,
             "time": _iso_utc(generated_hour),
             "zones": items,
+            "meta": {
+                "spatial_mode": "zones",
+                "zoom_detail": {
+                    "zoom": zoom,
+                    "mode": "zones",
+                    "grid_cells_per_side": side,
+                },
+            },
         }
 
     def _get_field_zonal_stats(
@@ -2794,10 +3015,25 @@ class Stage5ApiApp:
             raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: диапазон времени", status=422)
         if range_start < (datetime.now(timezone.utc) - timedelta(days=30)):
             raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: диапазон вне доступного хранения", status=422)
-
+        if "baseline_id" in payload and not payload.get("baseline_id"):
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: сценарий без baseline недопустим", status=422)
         baseline_id = self._str_value(payload.get("baseline_id") or uuid.uuid4().hex, "baseline_id", min_len=6, max_len=80)
         params = payload.get("params", {})
         validated_params = self._validate_scenario_params(params)
+
+        baseline_count_raw = db.exec_checked(
+            f"""
+            SELECT COUNT(*)
+            FROM provider_observations
+            WHERE field_id = {field_id}
+              AND source = {_sql_quote(source)}
+              AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                  AND {_sql_quote(_iso_utc(range_end))}::timestamptz;
+            """,
+            tuples_only=True,
+        )
+        if self._scalar_int(baseline_count_raw) == 0:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: сценарий без baseline недопустим", status=422)
 
         scenario_id = uuid.uuid4().hex
         db.exec_checked(
@@ -2949,12 +3185,81 @@ class Stage5ApiApp:
                 }
             )
 
+        def estimate_et0(values_map: dict[str, tuple[float, str]]) -> float:
+            t = float(values_map.get("temperature", (0.0, "C"))[0])
+            rh = float(values_map.get("humidity_rh", (60.0, "%"))[0])
+            wind = float(values_map.get("wind_speed", (2.0, "m/s"))[0])
+            rad = float(values_map.get("radiation", (220.0, "W/m2"))[0])
+            rh = max(0.0, min(100.0, rh))
+            wind = max(0.0, wind)
+            rad = max(0.0, rad)
+            es = 0.6108 * math.exp((17.27 * t) / (t + 237.3))
+            ea = es * (rh / 100.0)
+            delta = 4098.0 * es / ((t + 237.3) ** 2)
+            gamma = 0.066
+            rn = (rad * 0.0864) * 0.77
+            numerator = 0.408 * delta * rn + gamma * (900.0 / (t + 273.0)) * wind * max(0.0, es - ea)
+            denominator = delta + gamma * (1.0 + 0.34 * wind)
+            if denominator <= 0:
+                return 0.0
+            return max(0.0, numerator / denominator)
+
+        baseline_et0 = estimate_et0(baseline)
+        scenario_et0 = estimate_et0(scenario_values)
+        baseline_precip = float(baseline.get("precipitation", (0.0, "mm"))[0])
+        scenario_precip = float(scenario_values.get("precipitation", (0.0, "mm"))[0])
+        baseline_water_deficit = baseline_et0 - baseline_precip
+        scenario_water_deficit = scenario_et0 - scenario_precip
+
+        derived_diff = [
+            {
+                "metric": "et0_mm_day",
+                "baseline": round(baseline_et0, 4),
+                "scenario": round(scenario_et0, 4),
+                "delta": round(scenario_et0 - baseline_et0, 4),
+                "unit": "mm/day",
+            },
+            {
+                "metric": "water_deficit_mm",
+                "baseline": round(baseline_water_deficit, 4),
+                "scenario": round(scenario_water_deficit, 4),
+                "delta": round(scenario_water_deficit - baseline_water_deficit, 4),
+                "unit": "mm",
+            },
+        ]
+
+        scenario_recommendations: list[dict[str, Any]] = []
+        scenario_wind = float(scenario_values.get("wind_speed", (0.0, "m/s"))[0])
+        if scenario_wind > 8.0:
+            scenario_recommendations.append(
+                {
+                    "type": "spraying_window",
+                    "what_to_do": "Отложить опрыскивание",
+                    "why": f"Ветер {scenario_wind:.2f} м/с превышает безопасный порог 8 м/с",
+                    "confidence": "высокое",
+                }
+            )
+        if scenario_water_deficit > 5.0:
+            scenario_recommendations.append(
+                {
+                    "type": "irrigation",
+                    "what_to_do": "Планировать полив",
+                    "why": f"Водный дефицит {scenario_water_deficit:.2f} мм",
+                    "confidence": "среднее",
+                }
+            )
+
         result_payload = {
             "source": "scenario",
             "field_id": field_id,
             "from": _iso_utc(range_start),
             "to": _iso_utc(range_end),
             "values": result_values,
+            "derived": {
+                "et0_mm_day": round(scenario_et0, 4),
+                "water_deficit_mm": round(scenario_water_deficit, 4),
+            },
+            "recommendations": scenario_recommendations,
             "meta": {
                 "scenario_id": scenario_id,
                 "baseline_id": scenario.get("baseline_id"),
@@ -2965,6 +3270,8 @@ class Stage5ApiApp:
             "scenario_id": scenario_id,
             "baseline_id": scenario.get("baseline_id"),
             "metrics": diff_metrics,
+            "derived_metrics": derived_diff,
+            "recommendation_changes": scenario_recommendations,
             "map_hint": "Сравнение доступно для отображения на карте/графиках",
         }
 
@@ -3216,16 +3523,79 @@ class Stage5ApiApp:
             return "DOWN"
         return fallback if fallback in {"OK", "DEGRADED", "DOWN"} else "OK"
 
-    def _select_cell_size(self, layer: dict[str, Any], zoom: int) -> int:
-        sizes = [int(x) for x in (layer.get("grid_sizes_m") or [1000])]
-        sizes = sorted(set(sizes), reverse=True)
+    @staticmethod
+    def _nearest_size(sizes: list[int], target: int) -> int:
+        if not sizes:
+            return target
+        return min(sizes, key=lambda item: abs(item - target))
+
+    def _select_spatial_mode(self, layer: dict[str, Any], zoom: int, *, prefer: str) -> tuple[str, int]:
+        modes = {str(item) for item in (layer.get("spatial_modes") or ["grid"])}
+        sizes = sorted({int(x) for x in (layer.get("grid_sizes_m") or [1000])}, reverse=True)
+        if not sizes:
+            sizes = [1000]
+
         if zoom <= 9:
-            return sizes[0]
-        if zoom <= 12:
-            return sizes[min(1, len(sizes) - 1)]
-        if zoom <= 15:
-            return sizes[min(2, len(sizes) - 1)]
-        return sizes[-1]
+            mode = "field" if "field" in modes and prefer != "grid" else "grid"
+            target = 1000
+        elif zoom <= 12:
+            mode = "grid"
+            target = 500
+        elif zoom <= 14:
+            mode = "grid"
+            target = 250
+        else:
+            if "zones" in modes and prefer == "zones":
+                mode = "zones"
+            else:
+                mode = "grid"
+            target = 100
+
+        if mode not in modes:
+            mode = "grid" if "grid" in modes else sorted(modes)[0]
+
+        cell_size = self._nearest_size(sizes, target)
+        return mode, int(cell_size)
+
+    def _select_cell_size(self, layer: dict[str, Any], zoom: int) -> int:
+        _, size = self._select_spatial_mode(layer, zoom, prefer="grid")
+        return size
+
+    def _layer_scalar_value(
+        self,
+        layer_id: str,
+        aggregated_by_metric: dict[str, float],
+        ix: int,
+        iy: int,
+    ) -> float:
+        base_metric = LAYER_METRIC_MAP.get(layer_id, ("",))[0]
+        base_value = float(aggregated_by_metric.get(base_metric, 0.0))
+        ndvi = float(aggregated_by_metric.get("ndvi", 0.0))
+        cloud = float(aggregated_by_metric.get("cloud_total", aggregated_by_metric.get("cloudiness", 0.0)))
+        soil = float(aggregated_by_metric.get("soil_moisture", 0.0))
+        precip = float(aggregated_by_metric.get("precipitation", 0.0))
+        wind = float(aggregated_by_metric.get("wind_speed", 0.0))
+        jitter = ((ix + 3) * (iy + 5)) % 7 / 100.0
+
+        if layer_id == "weather.vorticity_index":
+            return max(0.0, min(1.0, wind / 20.0 + jitter))
+        if layer_id == "soil.moisture_anomaly":
+            return max(-50.0, min(50.0, soil - 35.0))
+        if layer_id == "soil.trafficability_risk":
+            risk = (soil / 100.0) * 0.6 + min(1.0, precip / 20.0) * 0.4
+            return max(0.0, min(1.0, risk))
+        if layer_id in {"sat.scene_quality", "sat.cloud_mask"}:
+            return max(0.0, min(100.0, cloud))
+        if layer_id == "sat.growth_rate":
+            return max(-0.2, min(0.2, ndvi - 0.45))
+        if layer_id == "sat.field_uniformity_cv":
+            return max(0.0, min(1.0, 0.12 + jitter * 4))
+        if layer_id == "sat.anomaly_vs_baseline":
+            return max(-1.0, min(1.0, ndvi - 0.45))
+        if layer_id == "sat.season_curve":
+            return max(0.0, min(1.0, ndvi))
+
+        return base_value
 
     def _point_in_field(self, db: DbClient, field_id: int, lon: float, lat: float) -> bool:
         payload = db.query_json(
@@ -3502,6 +3872,697 @@ class Stage5ApiApp:
             assumptions.append("Сценарий без изменений параметров: baseline без модификаций")
 
         return scenario, assumptions
+
+    # -------------------------------
+    # Stage6 algorithms (derived block)
+    # -------------------------------
+    def _load_metric_rows(
+        self,
+        db: DbClient,
+        *,
+        field_id: int,
+        source: str,
+        metrics: list[str],
+        range_start: datetime,
+        range_end: datetime,
+    ) -> list[dict[str, Any]]:
+        metrics_sql = ", ".join(_sql_quote(metric) for metric in metrics)
+        rows = db.query_json(
+            f"""
+            SELECT COALESCE(json_agg(row_to_json(x) ORDER BY x.observed_at), '[]'::json)
+            FROM (
+                SELECT
+                    metric_code AS metric,
+                    ROUND(value::numeric, 6)::double precision AS value,
+                    unit,
+                    to_char(observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+                    quality_flags,
+                    observed_at
+                FROM provider_observations
+                WHERE field_id = {field_id}
+                  AND source = {_sql_quote(source)}
+                  AND metric_code IN ({metrics_sql})
+                  AND observed_at BETWEEN {_sql_quote(_iso_utc(range_start))}::timestamptz
+                                      AND {_sql_quote(_iso_utc(range_end))}::timestamptz
+            ) x;
+            """
+        )
+        assert isinstance(rows, list)
+        return rows
+
+    @staticmethod
+    def _rows_by_metric(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            metric = str(row.get("metric") or "")
+            grouped.setdefault(metric, []).append(row)
+        return grouped
+
+    def _validate_metric_units(self, rows_by_metric: dict[str, list[dict[str, Any]]], metrics: list[str]) -> None:
+        for metric in metrics:
+            expected = EXPECTED_UNITS.get(metric)
+            if expected is None:
+                continue
+            series = rows_by_metric.get(metric) or []
+            if not series:
+                continue
+            unit = str(series[0].get("unit") or "")
+            if unit != expected:
+                raise ApiError(
+                    "VALIDATION_ERROR",
+                    f"Некорректные входные данные: единицы {metric} ({unit}), ожидается {expected}",
+                    status=422,
+                )
+
+    def _algorithm_quality_summary(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        flags = self._quality_flags_summary(rows)
+        total_points = len(rows)
+        low_flags = 0
+        for flag_name, count in flags.items():
+            if flag_name in {"low_confidence", "cloudy", "cloud_mask_interpolated", "low_quality"}:
+                low_flags += int(count)
+        confidence = "high"
+        if total_points > 0 and (low_flags / total_points) > 0.2:
+            confidence = "low"
+        elif total_points > 0 and (low_flags / total_points) > 0.05:
+            confidence = "medium"
+        return {
+            "total_points": total_points,
+            "quality_flags": flags,
+            "low_quality_points": low_flags,
+            "confidence": confidence,
+        }
+
+    def _algorithm_raw_block(
+        self,
+        db: DbClient,
+        *,
+        source: str,
+        range_start: datetime,
+        range_end: datetime,
+        rows: list[dict[str, Any]],
+        metric_count: int,
+    ) -> dict[str, Any]:
+        coverage = self._coverage_percent(range_start, range_end, len(rows), metric_count)
+        return {
+            "source": source,
+            "last_sync_at": self._source_last_sync(db, source),
+            "data_coverage": coverage,
+            "quality_flags": self._quality_flags_summary(rows),
+            "values": rows,
+        }
+
+    def _store_algorithm_run(
+        self,
+        db: DbClient,
+        *,
+        field_id: int,
+        source: str,
+        algorithm_id: str,
+        range_start: datetime,
+        range_end: datetime,
+        status: str,
+        reason: str | None,
+        error_code: str | None,
+        inputs_used: dict[str, Any],
+        quality_summary: dict[str, Any],
+        result_payload: dict[str, Any] | None,
+        user_id: int | None,
+        request_id: str,
+    ) -> None:
+        run_id = uuid.uuid4().hex
+        db.exec_checked(
+            f"""
+            INSERT INTO api_algorithm_runs (
+                run_id,
+                field_id,
+                source,
+                algorithm_id,
+                algorithm_version,
+                range_start,
+                range_end,
+                status,
+                reason,
+                error_code,
+                inputs_used,
+                quality_summary,
+                result_payload,
+                created_by,
+                request_id
+            ) VALUES (
+                {_sql_quote(run_id)},
+                {field_id},
+                {_sql_quote(source)},
+                {_sql_quote(algorithm_id)},
+                {_sql_quote(ALGORITHM_VERSION)},
+                {_sql_quote(_iso_utc(range_start))}::timestamptz,
+                {_sql_quote(_iso_utc(range_end))}::timestamptz,
+                {_sql_quote(status)},
+                {(_sql_quote(reason) if reason is not None else 'NULL')},
+                {(_sql_quote(error_code) if error_code is not None else 'NULL')},
+                {_sql_quote(json.dumps(inputs_used, ensure_ascii=False))}::jsonb,
+                {_sql_quote(json.dumps(quality_summary, ensure_ascii=False))}::jsonb,
+                {(_sql_quote(json.dumps(result_payload, ensure_ascii=False)) + '::jsonb') if result_payload is not None else 'NULL'},
+                {str(user_id) if user_id is not None else 'NULL'},
+                {_sql_quote(request_id)}
+            );
+            """
+        )
+
+    def _algorithm_context(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+    ) -> tuple[str, datetime, datetime]:
+        field = self._get_field(db, user, field_id, include_deleted=False)
+        self._assert_enterprise_scope(user, int(field["enterprise_id"]))
+        source = self._normalize_source(self._query_str(query, "source", required=False) or "Copernicus")
+        range_start = self._parse_datetime(self._query_str(query, "from", required=True))
+        range_end = self._parse_datetime(self._query_str(query, "to", required=True))
+        if range_end < range_start:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: диапазон времени", status=422)
+        return source, range_start, range_end
+
+    def _get_algorithm_gdd(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+        request_id: str,
+    ) -> dict[str, Any]:
+        source, range_start, range_end = self._algorithm_context(db, user, field_id, query)
+        tbase = float(self._query_str(query, "tbase", required=False) or 10.0)
+
+        rows = self._load_metric_rows(
+            db,
+            field_id=field_id,
+            source=source,
+            metrics=["temperature"],
+            range_start=range_start,
+            range_end=range_end,
+        )
+        rows_by_metric = self._rows_by_metric(rows)
+        self._validate_metric_units(rows_by_metric, ["temperature"])
+
+        quality_summary = self._algorithm_quality_summary(rows)
+        raw = {
+            "source": source,
+            "last_sync_at": self._source_last_sync(db, source),
+            "data_coverage": self._coverage_percent(range_start, range_end, len(rows), 1),
+            "quality_flags": self._quality_flags_summary(rows),
+            "values": rows,
+        }
+
+        temp_rows = rows_by_metric.get("temperature", [])
+        if not temp_rows:
+            derived = {
+                "status": "INSUFFICIENT_DATA",
+                "reason": "Недостаточно данных: отсутствуют температуры",
+                "algorithm_id": "gdd",
+                "algorithm_version": ALGORITHM_VERSION,
+                "inputs_used": {"metrics": ["temperature"], "tbase_c": tbase},
+                "quality_summary": quality_summary,
+                "values": [],
+            }
+            self._store_algorithm_run(
+                db,
+                field_id=field_id,
+                source=source,
+                algorithm_id="gdd",
+                range_start=range_start,
+                range_end=range_end,
+                status="INSUFFICIENT_DATA",
+                reason=derived["reason"],
+                error_code=None,
+                inputs_used=derived["inputs_used"],
+                quality_summary=quality_summary,
+                result_payload={"values": []},
+                user_id=user.user_id,
+                request_id=request_id,
+            )
+            return {
+                "field_id": field_id,
+                "from": _iso_utc(range_start),
+                "to": _iso_utc(range_end),
+                "raw": raw,
+                "derived": derived,
+            }
+
+        by_day: dict[str, list[float]] = {}
+        for row in temp_rows:
+            ts = str(row.get("timestamp") or "")
+            day = ts[:10]
+            by_day.setdefault(day, []).append(float(row.get("value") or 0.0))
+
+        values: list[dict[str, Any]] = []
+        gdd_accum = 0.0
+        for day in sorted(by_day.keys()):
+            tmean = sum(by_day[day]) / max(1, len(by_day[day]))
+            gdd_day = max(0.0, tmean - tbase)
+            gdd_accum += gdd_day
+            values.append(
+                {
+                    "date": day,
+                    "tmean_c": round(tmean, 4),
+                    "gdd_day": round(gdd_day, 4),
+                    "gdd_accum": round(gdd_accum, 4),
+                }
+            )
+
+        derived = {
+            "status": "OK",
+            "reason": None,
+            "algorithm_id": "gdd",
+            "algorithm_version": ALGORITHM_VERSION,
+            "inputs_used": {"metrics": ["temperature"], "tbase_c": tbase},
+            "quality_summary": quality_summary,
+            "values": values,
+        }
+        self._store_algorithm_run(
+            db,
+            field_id=field_id,
+            source=source,
+            algorithm_id="gdd",
+            range_start=range_start,
+            range_end=range_end,
+            status="OK",
+            reason=None,
+            error_code=None,
+            inputs_used=derived["inputs_used"],
+            quality_summary=quality_summary,
+            result_payload={"values": values},
+            user_id=user.user_id,
+            request_id=request_id,
+        )
+        return {
+            "field_id": field_id,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "raw": raw,
+            "derived": derived,
+        }
+
+    def _get_algorithm_vpd(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+        request_id: str,
+    ) -> dict[str, Any]:
+        source, range_start, range_end = self._algorithm_context(db, user, field_id, query)
+        granularity = self._query_str(query, "granularity", required=False) or "hour"
+        if granularity not in {"hour", "day"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: granularity", status=422)
+
+        rows = self._load_metric_rows(
+            db,
+            field_id=field_id,
+            source=source,
+            metrics=["temperature", "humidity_rh"],
+            range_start=range_start,
+            range_end=range_end,
+        )
+        rows_by_metric = self._rows_by_metric(rows)
+        self._validate_metric_units(rows_by_metric, ["temperature", "humidity_rh"])
+        quality_summary = self._algorithm_quality_summary(rows)
+
+        raw = {
+            "source": source,
+            "last_sync_at": self._source_last_sync(db, source),
+            "data_coverage": self._coverage_percent(range_start, range_end, len(rows), 2),
+            "quality_flags": self._quality_flags_summary(rows),
+            "values": rows,
+        }
+
+        temp_by_ts = {str(row.get("timestamp")): float(row.get("value") or 0.0) for row in rows_by_metric.get("temperature", [])}
+        rh_by_ts = {str(row.get("timestamp")): float(row.get("value") or 0.0) for row in rows_by_metric.get("humidity_rh", [])}
+        common_ts = sorted(set(temp_by_ts.keys()) & set(rh_by_ts.keys()))
+
+        if not common_ts:
+            derived = {
+                "status": "INSUFFICIENT_DATA",
+                "reason": "Недостаточно данных: нужны температура и влажность",
+                "algorithm_id": "vpd",
+                "algorithm_version": ALGORITHM_VERSION,
+                "inputs_used": {"metrics": ["temperature", "humidity_rh"], "formula": "es-ea"},
+                "quality_summary": quality_summary,
+                "values": [],
+            }
+            self._store_algorithm_run(
+                db,
+                field_id=field_id,
+                source=source,
+                algorithm_id="vpd",
+                range_start=range_start,
+                range_end=range_end,
+                status="INSUFFICIENT_DATA",
+                reason=derived["reason"],
+                error_code=None,
+                inputs_used=derived["inputs_used"],
+                quality_summary=quality_summary,
+                result_payload={"values": []},
+                user_id=user.user_id,
+                request_id=request_id,
+            )
+            return {
+                "field_id": field_id,
+                "from": _iso_utc(range_start),
+                "to": _iso_utc(range_end),
+                "raw": raw,
+                "derived": derived,
+            }
+
+        vpd_points: list[dict[str, Any]] = []
+        for ts in common_ts:
+            t = temp_by_ts[ts]
+            rh = max(0.0, min(100.0, rh_by_ts[ts]))
+            es = 0.6108 * math.exp((17.27 * t) / (t + 237.3))
+            ea = es * (rh / 100.0)
+            vpd = max(0.0, es - ea)
+            vpd_points.append({"timestamp": ts, "temperature_c": round(t, 4), "humidity_rh": round(rh, 4), "vpd_kpa": round(vpd, 6)})
+
+        if granularity == "day":
+            by_day: dict[str, list[float]] = {}
+            for item in vpd_points:
+                by_day.setdefault(str(item["timestamp"])[:10], []).append(float(item["vpd_kpa"]))
+            values = [
+                {
+                    "date": day,
+                    "vpd_kpa": round(sum(vals) / max(1, len(vals)), 6),
+                    "vpd_min_kpa": round(min(vals), 6),
+                    "vpd_max_kpa": round(max(vals), 6),
+                }
+                for day, vals in sorted(by_day.items())
+            ]
+        else:
+            values = vpd_points
+
+        derived = {
+            "status": "OK",
+            "reason": None,
+            "algorithm_id": "vpd",
+            "algorithm_version": ALGORITHM_VERSION,
+            "inputs_used": {"metrics": ["temperature", "humidity_rh"], "formula": "es-ea", "granularity": granularity},
+            "quality_summary": quality_summary,
+            "values": values,
+        }
+        self._store_algorithm_run(
+            db,
+            field_id=field_id,
+            source=source,
+            algorithm_id="vpd",
+            range_start=range_start,
+            range_end=range_end,
+            status="OK",
+            reason=None,
+            error_code=None,
+            inputs_used=derived["inputs_used"],
+            quality_summary=quality_summary,
+            result_payload={"values": values},
+            user_id=user.user_id,
+            request_id=request_id,
+        )
+        return {
+            "field_id": field_id,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "raw": raw,
+            "derived": derived,
+        }
+
+    def _get_algorithm_et0(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+        request_id: str,
+    ) -> dict[str, Any]:
+        source, range_start, range_end = self._algorithm_context(db, user, field_id, query)
+        granularity = self._query_str(query, "granularity", required=False) or "day"
+        if granularity not in {"hour", "day"}:
+            raise ApiError("VALIDATION_ERROR", "Некорректные входные данные: granularity", status=422)
+        allow_approx = self._query_bool(query, "allow_approx", default=True)
+
+        metrics = ["temperature", "humidity_rh", "wind_speed", "radiation"]
+        rows = self._load_metric_rows(
+            db,
+            field_id=field_id,
+            source=source,
+            metrics=metrics,
+            range_start=range_start,
+            range_end=range_end,
+        )
+        rows_by_metric = self._rows_by_metric(rows)
+        self._validate_metric_units(rows_by_metric, metrics)
+        quality_summary = self._algorithm_quality_summary(rows)
+
+        raw = {
+            "source": source,
+            "last_sync_at": self._source_last_sync(db, source),
+            "data_coverage": self._coverage_percent(range_start, range_end, len(rows), len(metrics)),
+            "quality_flags": self._quality_flags_summary(rows),
+            "values": rows,
+        }
+
+        data_by_ts: dict[str, dict[str, float]] = {}
+        for metric in metrics:
+            for row in rows_by_metric.get(metric, []):
+                ts = str(row.get("timestamp"))
+                data_by_ts.setdefault(ts, {})[metric] = float(row.get("value") or 0.0)
+
+        points: list[dict[str, Any]] = []
+        variant = "fao56_simplified"
+        warnings: list[str] = []
+        for ts in sorted(data_by_ts.keys()):
+            item = data_by_ts[ts]
+            if "temperature" not in item:
+                continue
+
+            t = item["temperature"]
+            rh = item.get("humidity_rh")
+            wind = item.get("wind_speed")
+            rad = item.get("radiation")
+
+            if rh is None or wind is None or rad is None:
+                if not allow_approx:
+                    continue
+                variant = "approx"
+                rh = 60.0 if rh is None else rh
+                wind = 2.0 if wind is None else wind
+                rad = 220.0 if rad is None else rad
+                warnings = ["Использован упрощённый вариант ET0 (algorithm_variant=approx)"]
+
+            rh = max(0.0, min(100.0, float(rh)))
+            wind = max(0.0, float(wind))
+            rad = max(0.0, float(rad))
+
+            es = 0.6108 * math.exp((17.27 * t) / (t + 237.3))
+            ea = es * (rh / 100.0)
+            delta = 4098.0 * es / ((t + 237.3) ** 2)
+            gamma = 0.066
+            rn = (rad * 0.0864) * 0.77
+            numerator = 0.408 * delta * rn + gamma * (900.0 / (t + 273.0)) * wind * max(0.0, es - ea)
+            denominator = delta + gamma * (1.0 + 0.34 * wind)
+            et0 = max(0.0, numerator / denominator) if denominator > 0 else 0.0
+
+            points.append(
+                {
+                    "timestamp": ts,
+                    "temperature_c": round(t, 4),
+                    "humidity_rh": round(rh, 4),
+                    "wind_ms": round(wind, 4),
+                    "radiation_wm2": round(rad, 4),
+                    "et0_mm_day": round(et0, 6),
+                }
+            )
+
+        if not points:
+            reason = "Недостаточно данных: ET0 требует температуру, влажность, ветер и радиацию"
+            if allow_approx:
+                reason += " (или приблизительный режим)"
+            derived = {
+                "status": "INSUFFICIENT_DATA",
+                "reason": reason,
+                "algorithm_id": "et0",
+                "algorithm_version": ALGORITHM_VERSION,
+                "algorithm_variant": "approx" if allow_approx else "strict",
+                "inputs_used": {"metrics": metrics, "granularity": granularity, "allow_approx": allow_approx},
+                "quality_summary": quality_summary,
+                "warnings": warnings,
+                "values": [],
+            }
+            self._store_algorithm_run(
+                db,
+                field_id=field_id,
+                source=source,
+                algorithm_id="et0",
+                range_start=range_start,
+                range_end=range_end,
+                status="INSUFFICIENT_DATA",
+                reason=reason,
+                error_code=None,
+                inputs_used=derived["inputs_used"],
+                quality_summary=quality_summary,
+                result_payload={"values": []},
+                user_id=user.user_id,
+                request_id=request_id,
+            )
+            return {
+                "field_id": field_id,
+                "from": _iso_utc(range_start),
+                "to": _iso_utc(range_end),
+                "raw": raw,
+                "derived": derived,
+            }
+
+        if granularity == "day":
+            by_day: dict[str, list[float]] = {}
+            for item in points:
+                by_day.setdefault(str(item["timestamp"])[:10], []).append(float(item["et0_mm_day"]))
+            values = [
+                {
+                    "date": day,
+                    "et0_mm_day": round(sum(vals) / max(1, len(vals)), 6),
+                    "et0_min_mm_day": round(min(vals), 6),
+                    "et0_max_mm_day": round(max(vals), 6),
+                }
+                for day, vals in sorted(by_day.items())
+            ]
+        else:
+            values = points
+
+        derived = {
+            "status": "OK",
+            "reason": None,
+            "algorithm_id": "et0",
+            "algorithm_version": ALGORITHM_VERSION,
+            "algorithm_variant": variant,
+            "inputs_used": {"metrics": metrics, "granularity": granularity, "allow_approx": allow_approx},
+            "quality_summary": quality_summary,
+            "warnings": warnings,
+            "values": values,
+        }
+        self._store_algorithm_run(
+            db,
+            field_id=field_id,
+            source=source,
+            algorithm_id="et0",
+            range_start=range_start,
+            range_end=range_end,
+            status="OK",
+            reason=None,
+            error_code=None,
+            inputs_used=derived["inputs_used"],
+            quality_summary=quality_summary,
+            result_payload={"values": values},
+            user_id=user.user_id,
+            request_id=request_id,
+        )
+        return {
+            "field_id": field_id,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "raw": raw,
+            "derived": derived,
+        }
+
+    def _get_algorithm_water_deficit(
+        self,
+        db: DbClient,
+        user: UserContext,
+        field_id: int,
+        query: dict[str, list[str]],
+        request_id: str,
+    ) -> dict[str, Any]:
+        source, range_start, range_end = self._algorithm_context(db, user, field_id, query)
+
+        precip = self._metric_aggregate(
+            db,
+            field_id=field_id,
+            source=source,
+            metric="precipitation",
+            range_start=range_start,
+            range_end=range_end,
+            agg="sum",
+        )
+        et0_payload = self._get_algorithm_et0(db, user, field_id, {"from": [_iso_utc(range_start)], "to": [_iso_utc(range_end)], "source": [source], "granularity": ["day"], "allow_approx": ["true"]}, request_id)
+        et0_values = et0_payload.get("derived", {}).get("values", []) if isinstance(et0_payload.get("derived"), dict) else []
+        et0_sum = 0.0
+        for row in et0_values:
+            if isinstance(row, dict):
+                et0_sum += float(row.get("et0_mm_day") or 0.0)
+
+        status = "OK"
+        reason = None
+        if precip is None and et0_sum <= 0:
+            status = "INSUFFICIENT_DATA"
+            reason = "Недостаточно данных: отсутствуют осадки и ET0"
+
+        water_deficit = et0_sum - float(precip or 0.0)
+        quality_summary = et0_payload.get("derived", {}).get("quality_summary", {}) if isinstance(et0_payload.get("derived"), dict) else {}
+        derived = {
+            "status": status,
+            "reason": reason,
+            "algorithm_id": "water_deficit",
+            "algorithm_version": ALGORITHM_VERSION,
+            "inputs_used": {"metrics": ["precipitation", "et0"], "formula": "et0_sum - precip_sum"},
+            "quality_summary": quality_summary,
+            "values": [
+                {
+                    "from": _iso_utc(range_start),
+                    "to": _iso_utc(range_end),
+                    "et0_sum_mm": round(et0_sum, 6),
+                    "precip_sum_mm": round(float(precip or 0.0), 6),
+                    "water_deficit_mm": round(water_deficit, 6),
+                }
+            ],
+        }
+        self._store_algorithm_run(
+            db,
+            field_id=field_id,
+            source=source,
+            algorithm_id="water_deficit",
+            range_start=range_start,
+            range_end=range_end,
+            status=status,
+            reason=reason,
+            error_code=None,
+            inputs_used=derived["inputs_used"],
+            quality_summary=(quality_summary if isinstance(quality_summary, dict) else {}),
+            result_payload={"values": derived["values"]},
+            user_id=user.user_id,
+            request_id=request_id,
+        )
+
+        raw_values = self._load_metric_rows(
+            db,
+            field_id=field_id,
+            source=source,
+            metrics=["precipitation", "temperature", "humidity_rh", "wind_speed", "radiation"],
+            range_start=range_start,
+            range_end=range_end,
+        )
+        raw = {
+            "source": source,
+            "last_sync_at": self._source_last_sync(db, source),
+            "data_coverage": self._coverage_percent(range_start, range_end, len(raw_values), 5),
+            "quality_flags": self._quality_flags_summary(raw_values),
+            "values": raw_values,
+        }
+        return {
+            "field_id": field_id,
+            "from": _iso_utc(range_start),
+            "to": _iso_utc(range_end),
+            "raw": raw,
+            "derived": derived,
+        }
 
     # -------------------------------
     # Assistant rules / alerts
@@ -3809,6 +4870,12 @@ class Stage5ApiApp:
                     "data_quality": evaluation["quality"],
                     "level": rule["severity"],
                     "at": _iso_utc(at),
+                    "based_on_data": evaluation["evidence"],
+                    "confidence": ("низкое" if evaluation["quality"] == "low" else "высокое"),
+                    "alternatives": [
+                        "Перенести операцию на окно со скоростью ветра ниже порога",
+                        "Уточнить прогноз через 3-6 часов перед выездом в поле",
+                    ] if str(rule.get("parameter")) == "wind" else [],
                 }
             )
 
@@ -4038,7 +5105,7 @@ class Stage5ApiApp:
         quality = "ok"
         for row in records:
             flags = [str(flag) for flag in row.get("quality_flags", [])]
-            if any(flag in {"cloudy", "low_confidence", "cloud_mask_interpolated"} for flag in flags):
+            if any(flag in {"cloudy", "low_confidence", "cloud_mask_interpolated", "low_quality"} for flag in flags):
                 quality = "low"
                 break
 

@@ -32,6 +32,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_stage3_workflows.py"], "Интеграционные тесты этапа 3"),
         ([sys.executable, "scripts/test_stage4_proxy.py"], "Интеграционные тесты этапа 4"),
         ([sys.executable, "scripts/test_stage5_api.py"], "Интеграционные/API тесты этапа 5"),
+        ([sys.executable, "scripts/test_stage6_algorithms.py"], "Интеграционные/алгоритмические тесты этапа 6"),
     ]
 
     try:

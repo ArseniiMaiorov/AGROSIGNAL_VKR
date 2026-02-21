@@ -1,0 +1,9 @@
+{
+  "algorithm_id": "gdd",
+  "tbase_c": 10.0,
+  "values": [
+    {"date": "2026-01-10", "tmean_c": 17.0, "gdd_day": 7.0, "gdd_accum": 7.0},
+    {"date": "2026-01-11", "tmean_c": 15.75, "gdd_day": 5.75, "gdd_accum": 12.75}
+  ],
+  "tolerance": 0.0005
+}

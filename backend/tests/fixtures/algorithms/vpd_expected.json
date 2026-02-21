@@ -1,0 +1,9 @@
+{
+  "algorithm_id": "vpd",
+  "granularity": "day",
+  "values": [
+    {"date": "2026-01-10", "vpd_kpa": 0.882760},
+    {"date": "2026-01-11", "vpd_kpa": 0.717321}
+  ],
+  "tolerance": 0.001
+}

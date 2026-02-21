@@ -1,0 +1,10 @@
+{
+  "algorithm_id": "et0",
+  "granularity": "day",
+  "algorithm_variant": "fao56_simplified",
+  "values": [
+    {"date": "2026-01-10", "et0_mm_day": 5.333746},
+    {"date": "2026-01-11", "et0_mm_day": 5.226898}
+  ],
+  "tolerance": 0.001
+}

@@ -6,7 +6,7 @@ API_MODE_FILE := .api_mode
 SCHEDULER_PID_FILE := .scheduler.pid
 SCHEDULER_LOG_FILE := .scheduler.log
 
-.PHONY: build up down ps logs lint test migrate test-stage2 test-stage3 test-stage4 test-stage5 quality print-port stage3-sync stage3-cycle stage4-admin stage4-proxy-get stage4-health stage4-metrics stage4-request-log install-cli
+.PHONY: build up down ps logs lint test migrate test-stage2 test-stage3 test-stage4 test-stage5 test-stage6 quality print-port stage3-sync stage3-cycle stage4-admin stage4-proxy-get stage4-health stage4-metrics stage4-request-log install-cli
 
 build:
 	$(COMPOSE) build api
@@ -132,6 +132,9 @@ test-stage4: migrate
 
 test-stage5: migrate
 	python3 scripts/test_stage5_api.py
+
+test-stage6: migrate
+	python3 scripts/test_stage6_algorithms.py
 
 quality:
 	python3 scripts/run_quality_gate.py
